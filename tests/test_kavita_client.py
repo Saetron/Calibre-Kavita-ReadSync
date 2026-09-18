@@ -32,6 +32,18 @@ async def test_kavita_client_koreader_and_ondeck(monkeypatch):
             })
         elif url_str.endswith("/syncs/progress") and request.method == "PUT":
             return httpx.Response(200, json={"message": "Success"})
+        elif "/api/search/search" in url_str:
+            return httpx.Response(200, json={
+                "files": [{"id": 1, "filePath": "/books/Hobbit {42}.epub", "pages": 300}],
+                "chapters": [],
+                "series": [],
+            })
+        elif "/api/search/series-for-mangafile" in url_str:
+            return httpx.Response(200, json={"id": 10, "name": "The Hobbit Series", "libraryId": 1})
+        elif "/api/reader/mark-read" in url_str:
+            return httpx.Response(200, json={"message": "Marked read"})
+        elif "/api/reader/progress" in url_str:
+            return httpx.Response(200, json={"message": "Progress saved"})
         elif "/api/series/on-deck" in url_str:
             return httpx.Response(200, json=[
                 {"id": 10, "name": "The Hobbit Series"}
@@ -87,6 +99,13 @@ async def test_kavita_client_koreader_and_ondeck(monkeypatch):
     assert recent_reads[0].calibre_id == 42
     assert recent_reads[0].percentage == 0.5  # 150 / 300
     assert recent_reads[0].filename == "The Hobbit {42}.epub"
+
+    # 5. Test WebUI progress updates (100% -> mark-read, 50% -> progress)
+    webui_ok_100 = await kavita.update_webui_progress(calibre_id=42, percentage=1.0, title="The Hobbit")
+    assert webui_ok_100 is True
+
+    webui_ok_50 = await kavita.update_webui_progress(calibre_id=42, percentage=0.5, title="The Hobbit")
+    assert webui_ok_50 is True
 
 
 @pytest.mark.asyncio

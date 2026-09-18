@@ -185,6 +185,15 @@ class Synchronizer:
                             message=f"Synced KOReader progress from Kavita to Calibre #{book.book_id} ({round(ko_rec.percentage * 100, 1)}%)",
                         )
                     )
+                    # Also make sure Kavita WebUI has this reading progress marked
+                    try:
+                        await self.kavita.update_webui_progress(
+                            calibre_id=book.book_id,
+                            percentage=ko_rec.percentage,
+                            title=book.title,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to update Kavita WebUI for #{book.book_id}: {e}")
 
         return updated_count
 

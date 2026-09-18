@@ -33,6 +33,7 @@ class KavitaClient(BaseSyncClient):
         self.koreader_url = f"{self.raw_base_url}/api/koreader/{self.api_key}"
         self.timeout = timeout
         self.jwt_token: Optional[str] = None
+        self._calibre_id_to_kavita: Dict[int, Dict[str, Any]] = {}
 
     @property
     def name(self) -> str:
@@ -125,7 +126,7 @@ class KavitaClient(BaseSyncClient):
             return None
 
     async def update_progress(self, record: ProgressRecord) -> bool:
-        """Pushes reading progress to Kavita's KOReader sync endpoint."""
+        """Pushes reading progress to Kavita's KOReader sync endpoint AND Kavita WebUI."""
         url = f"{self.koreader_url}/syncs/progress"
         payload = {
             "document": record.document,
@@ -141,17 +142,209 @@ class KavitaClient(BaseSyncClient):
                 "filename": record.filename,
             }
 
+        ko_ok = False
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 res = await client.put(url, json=payload, headers=self._get_koreader_headers())
                 if res.status_code in (200, 201, 202):
                     logger.debug(f"Pushed progress to Kavita for {record.document} ({record.percentage})")
-                    return True
-                logger.warning(f"Kavita push progress returned status {res.status_code}: {res.text[:100]}")
-                return False
+                    ko_ok = True
+                else:
+                    logger.warning(f"Kavita push progress returned status {res.status_code}: {res.text[:100]}")
         except Exception as e:
             logger.error(f"Exception pushing progress to Kavita for {record.document}: {e}")
+
+        # Also update Kavita's WebUI reading progress for this user
+        if record.calibre_id:
+            await self.update_webui_progress(
+                calibre_id=record.calibre_id,
+                percentage=record.percentage,
+                title=record.title,
+            )
+
+        return ko_ok
+
+    async def find_kavita_metadata_by_calibre_id(
+        self, calibre_id: int, title: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Finds series, volume, and chapter IDs in Kavita for a given Calibre ID."""
+        if calibre_id in self._calibre_id_to_kavita:
+            return self._calibre_id_to_kavita[calibre_id]
+
+        headers = self._get_rest_headers()
+        queries = [f"{{{calibre_id}}}", str(calibre_id)]
+        if title:
+            clean_t = re.sub(r"[^\w\s]", " ", title).strip()
+            if clean_t:
+                queries.append(clean_t)
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                for q in queries:
+                    url = f"{self.raw_base_url}/api/Search/search"
+                    res = await client.get(url, params={"queryString": q, "includeChapterAndFiles": True}, headers=headers)
+                    if res.status_code != 200:
+                        continue
+
+                    data = res.json()
+                    # 1. Check files
+                    for f in data.get("files") or []:
+                        fp = f.get("filePath") or ""
+                        if extract_calibre_id(fp) == calibre_id:
+                            fid = f.get("id")
+                            s_res = await client.get(f"{self.raw_base_url}/api/Search/series-for-mangafile", params={"mangaFileId": fid}, headers=headers)
+                            if s_res.status_code == 200:
+                                s_data = s_res.json()
+                                sid = s_data.get("id")
+                                lid = s_data.get("libraryId")
+                                sname = s_data.get("name")
+                                res_meta = {
+                                    "series_id": sid,
+                                    "series_name": sname,
+                                    "library_id": lid,
+                                    "chapter_id": None,
+                                    "volume_id": None,
+                                    "pages": f.get("pages"),
+                                }
+                                self._calibre_id_to_kavita[calibre_id] = res_meta
+                                return res_meta
+
+                    # 2. Check chapters
+                    for ch in data.get("chapters") or []:
+                        ch_title = ch.get("title") or ""
+                        if extract_calibre_id(ch_title) == calibre_id:
+                            res_meta = {
+                                "series_id": ch.get("seriesId"),
+                                "series_name": ch_title,
+                                "chapter_id": ch.get("id"),
+                                "volume_id": ch.get("volumeId"),
+                                "library_id": None,
+                                "pages": ch.get("pages"),
+                            }
+                            self._calibre_id_to_kavita[calibre_id] = res_meta
+                            return res_meta
+
+                    # 3. Check series
+                    for s in data.get("series") or []:
+                        s_name = s.get("name") or ""
+                        sid = s.get("seriesId") or s.get("id")
+                        if extract_calibre_id(s_name) == calibre_id or (title and title.lower() in s_name.lower()):
+                            res_meta = {
+                                "series_id": sid,
+                                "series_name": s_name,
+                                "library_id": s.get("libraryId"),
+                                "chapter_id": None,
+                                "volume_id": None,
+                                "pages": None,
+                            }
+                            self._calibre_id_to_kavita[calibre_id] = res_meta
+                            return res_meta
+
+        except Exception as e:
+            logger.debug(f"Search for Calibre ID #{calibre_id} in Kavita encountered: {e}")
+
+        return None
+
+    async def update_webui_progress(
+        self,
+        calibre_id: int,
+        percentage: float,
+        title: Optional[str] = None,
+    ) -> bool:
+        """
+        Updates the reading progress in Kavita's WebUI for the authenticated user.
+        - If percentage >= 0.98: marks the series / chapter as read via /api/Reader/mark-read.
+        - If percentage <= 0.0: marks as unread via /api/Reader/mark-unread.
+        - If 0 < percentage < 0.98: saves current page progress via /api/Reader/progress.
+        """
+        await self.ensure_authenticated()
+
+        meta = await self.find_kavita_metadata_by_calibre_id(calibre_id, title)
+        if not meta:
+            logger.info(
+                f"Could not locate series in Kavita for Calibre ID #{calibre_id} ('{title or ''}') to update WebUI."
+            )
             return False
+
+        series_id = meta.get("series_id")
+        chapter_id = meta.get("chapter_id")
+        volume_id = meta.get("volume_id")
+        library_id = meta.get("library_id")
+        total_pages = meta.get("pages") or 100
+
+        headers = self._get_rest_headers()
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                # 1. 98%+ finished -> Mark as Read in Kavita WebUI
+                if percentage >= 0.98:
+                    url = f"{self.raw_base_url}/api/Reader/mark-read"
+                    payload = {"seriesId": series_id, "generateReadingSession": True}
+                    res = await client.post(url, json=payload, headers=headers)
+                    if res.status_code in (200, 201, 204):
+                        logger.info(
+                            f"Marked series #{series_id} ('{meta.get('series_name')}') as READ in Kavita WebUI."
+                        )
+                        if chapter_id:
+                            ch_url = f"{self.raw_base_url}/api/Reader/mark-chapter-read"
+                            await client.post(
+                                ch_url,
+                                json={"seriesId": series_id, "chapterId": chapter_id, "generateReadingSession": True},
+                                headers=headers,
+                            )
+                        return True
+                    else:
+                        logger.warning(f"Kavita mark-read returned status {res.status_code}: {res.text[:100]}")
+
+                # 2. 0% -> Mark as Unread
+                elif percentage <= 0.0:
+                    url = f"{self.raw_base_url}/api/Reader/mark-unread"
+                    payload = {"seriesId": series_id, "generateReadingSession": False}
+                    res = await client.post(url, json=payload, headers=headers)
+                    if res.status_code in (200, 201, 204):
+                        logger.info(f"Marked series #{series_id} as UNREAD in Kavita WebUI.")
+                        return True
+
+                # 3. Partial progress -> Save page progress in Kavita WebUI
+                else:
+                    if not chapter_id or not volume_id or not library_id:
+                        volumes = await self._fetch_series_volumes(series_id)
+                        if volumes:
+                            vol = volumes[0]
+                            volume_id = vol.get("id")
+                            chaps = vol.get("chapters", [])
+                            if chaps:
+                                ch = chaps[0]
+                                chapter_id = ch.get("id")
+                                total_pages = ch.get("pages") or total_pages
+                            if not library_id:
+                                library_id = meta.get("library_id") or 1
+
+                    if not library_id:
+                        library_id = 1
+
+                    page_num = max(1, round(percentage * total_pages))
+                    url = f"{self.raw_base_url}/api/Reader/progress"
+                    payload = {
+                        "seriesId": series_id,
+                        "volumeId": volume_id,
+                        "chapterId": chapter_id,
+                        "libraryId": library_id,
+                        "pageNum": page_num,
+                    }
+                    res = await client.post(url, json=payload, headers=headers)
+                    if res.status_code in (200, 201, 204):
+                        logger.info(
+                            f"Updated reading progress in Kavita WebUI for series #{series_id} ('{meta.get('series_name')}'): "
+                            f"page {page_num}/{total_pages} ({round(percentage * 100, 1)}%)"
+                        )
+                        return True
+                    else:
+                        logger.warning(f"Kavita save progress returned status {res.status_code}: {res.text[:100]}")
+
+        except Exception as e:
+            logger.error(f"Error updating Kavita WebUI reading progress for Calibre #{calibre_id}: {e}")
+
+        return False
 
     async def ensure_authenticated(self) -> bool:
         """Ensures that REST API authentication has been performed."""
