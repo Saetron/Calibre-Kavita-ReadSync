@@ -89,3 +89,24 @@ async def test_proxy_server_fanout():
             res = await client.get("/healthcheck")
             assert res.status_code == 200
             assert res.json()["tracked_documents"] == 1
+
+            # 5. Dashboard test (verify no IndexError/KeyError on events)
+            from kosync_hub.models import SyncEvent
+            db.log_sync_event(
+                SyncEvent(
+                    document="doc_hash_xyz",
+                    calibre_id=123,
+                    source="kavita",
+                    target="calibre",
+                    progress="10/20",
+                    percentage=0.5,
+                    timestamp=1710000000,
+                    success=True,
+                    message="Synced successfully",
+                )
+            )
+            res = await client.get("/")
+            assert res.status_code == 200
+            assert "Project Hail Mary" in res.text
+            assert "#123" in res.text
+

@@ -43,6 +43,7 @@ class InternalDatabase:
                 CREATE TABLE IF NOT EXISTS sync_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     document TEXT NOT NULL,
+                    calibre_id INTEGER,
                     source TEXT NOT NULL,
                     target TEXT NOT NULL,
                     progress TEXT NOT NULL,
@@ -52,6 +53,11 @@ class InternalDatabase:
                     message TEXT
                 )
             """)
+            try:
+                conn.execute("ALTER TABLE sync_events ADD COLUMN calibre_id INTEGER")
+            except sqlite3.OperationalError:
+                pass
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tracked_timestamp ON tracked_documents(timestamp)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_timestamp ON sync_events(timestamp DESC)")
             conn.commit()
@@ -148,11 +154,12 @@ class InternalDatabase:
             conn.execute(
                 """
                 INSERT INTO sync_events (
-                    document, source, target, progress, percentage, timestamp, success, message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    document, calibre_id, source, target, progress, percentage, timestamp, success, message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.document,
+                    event.calibre_id,
                     event.source,
                     event.target,
                     event.progress,

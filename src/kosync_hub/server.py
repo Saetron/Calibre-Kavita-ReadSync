@@ -178,28 +178,52 @@ def create_app(
         recent_events = db.get_recent_events(limit=15)
         tracked_docs = db.get_all_tracked_documents()[:15]
 
-        rows_html = "".join([
-            f"""<tr>
-                <td><strong>{d['title'] or 'Unknown'}</strong><br><small>{d['authors'] or ''}</small></td>
-                <td><span class="badge badge-primary">#{d['calibre_book_id'] or '-'}</span></td>
-                <td><code>{d['document'][:12]}...</code></td>
-                <td><div class="progress-bar"><div class="fill" style="width: {min(100, round(d['percentage'] * 100))}%"></div></div> {round(d['percentage'] * 100, 1)}%</td>
-                <td>{datetime.fromtimestamp(d['timestamp']).strftime('%Y-%m-%d %H:%M')}</td>
-                <td><span class="badge badge-success">{d['last_sync_status'] or 'synced'}</span></td>
-            </tr>"""
-            for d in tracked_docs
-        ])
+        rows_html_list = []
+        for d in tracked_docs:
+            d_dict = dict(d)
+            title = d_dict.get("title") or "Unknown"
+            authors = d_dict.get("authors") or ""
+            cal_id = d_dict.get("calibre_book_id")
+            doc = str(d_dict.get("document", ""))
+            pct = float(d_dict.get("percentage", 0.0))
+            ts = d_dict.get("timestamp", 0)
+            time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"
+            status = d_dict.get("last_sync_status") or "synced"
+            rows_html_list.append(
+                f"""<tr>
+                    <td><strong>{title}</strong><br><small>{authors}</small></td>
+                    <td><span class="badge badge-primary">#{cal_id if cal_id else '-'}</span></td>
+                    <td><code>{doc[:12]}...</code></td>
+                    <td><div class="progress-bar"><div class="fill" style="width: {min(100, round(pct * 100))}%"></div></div> {round(pct * 100, 1)}%</td>
+                    <td>{time_str}</td>
+                    <td><span class="badge badge-success">{status}</span></td>
+                </tr>"""
+            )
+        rows_html = "".join(rows_html_list)
 
-        events_html = "".join([
-            f"""<tr>
-                <td>{datetime.fromtimestamp(e['timestamp']).strftime('%H:%M:%S')}</td>
-                <td><span class="badge badge-info">{e['source']}</span> → <span class="badge badge-primary">{e['target']}</span></td>
-                <td>{f"#{e['calibre_id']}" if e['calibre_id'] else e['document'][:8] + '...'}</td>
-                <td>{round(e['percentage'] * 100, 1)}%</td>
-                <td>{'✅' if e['success'] else '❌'} {e['message'] or ''}</td>
-            </tr>"""
-            for e in recent_events
-        ])
+        events_html_list = []
+        for e in recent_events:
+            e_dict = dict(e)
+            ts = e_dict.get("timestamp", 0)
+            time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "-"
+            cal_id = e_dict.get("calibre_id")
+            doc = str(e_dict.get("document", ""))
+            ident = f"#{cal_id}" if cal_id else (doc[:8] + "..." if doc else "-")
+            pct = round(float(e_dict.get("percentage", 0.0)) * 100, 1)
+            src = e_dict.get("source", "unknown")
+            tgt = e_dict.get("target", "unknown")
+            success = e_dict.get("success", False)
+            msg = e_dict.get("message") or ""
+            events_html_list.append(
+                f"""<tr>
+                    <td>{time_str}</td>
+                    <td><span class="badge badge-info">{src}</span> → <span class="badge badge-primary">{tgt}</span></td>
+                    <td>{ident}</td>
+                    <td>{pct}%</td>
+                    <td>{'✅' if success else '❌'} {msg}</td>
+                </tr>"""
+            )
+        events_html = "".join(events_html_list)
 
         html = f"""<!DOCTYPE html>
 <html lang="en">
