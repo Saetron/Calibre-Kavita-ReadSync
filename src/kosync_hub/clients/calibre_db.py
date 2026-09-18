@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import unicodedata
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -54,11 +55,31 @@ class CalibreDbClient(BaseSyncClient):
     def name(self) -> str:
         return "Calibre DB"
 
+    def _register_calibre_functions(self, conn: sqlite3.Connection):
+        """Registers Calibre user-defined SQLite functions so triggers (like title_sort) work."""
+        def _title_sort(title: Optional[str]) -> str:
+            if not title:
+                return ""
+            return re.sub(r"^(A|An|The|Der|Die|Das|Ein|Eine)\s+", "", str(title), flags=re.IGNORECASE).strip()
+
+        for name, n_args, func in [
+            ("title_sort", 1, _title_sort),
+            ("uuid4", 0, lambda: str(uuid.uuid4())),
+            ("sort_authors", 1, lambda a: str(a or "")),
+            ("books_list_filter", 1, lambda v: 1),
+            ("fncase", 1, lambda v: str(v or "").lower()),
+        ]:
+            try:
+                conn.create_function(name, n_args, func)
+            except Exception:
+                pass
+
     def _get_connection(self) -> sqlite3.Connection:
         if not self.db_path.is_file():
             raise FileNotFoundError(f"Calibre database not found at {self.db_path}")
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         conn.row_factory = sqlite3.Row
+        self._register_calibre_functions(conn)
         return conn
 
     async def test_connection(self) -> bool:
@@ -337,12 +358,13 @@ class CalibreDbClient(BaseSyncClient):
             )
 
     def get_recently_read_books(self, limit: int = 50) -> List[CalibreBookRecord]:
-        """Fetches books from Calibre that have reading progress or were recently modified."""
+        """Fetches books from Calibre that have reading progress, have KOReader hashes, or were recently modified."""
         books = []
+        seen_ids = set()
         with self._get_connection() as conn:
             self._refresh_column_cache(conn)
 
-            # Check if read_pct or last_read tables exist
+            # 1. Books with reading progress
             if self.read_pct_label in self._column_cache:
                 col_id, _ = self._column_cache[self.read_pct_label]
                 cursor = conn.execute(
@@ -354,13 +376,40 @@ class CalibreDbClient(BaseSyncClient):
                     (limit,),
                 )
                 for r in cursor.fetchall():
-                    b = self.get_book_by_id(r["book"])
-                    if b:
-                        books.append(b)
-            else:
-                cursor = conn.execute("SELECT id FROM books ORDER BY id DESC LIMIT ?", (limit,))
+                    bid = r["book"]
+                    if bid not in seen_ids:
+                        seen_ids.add(bid)
+                        b = self.get_book_by_id(bid)
+                        if b:
+                            books.append(b)
+
+            # 2. Books with KOReader identifier
+            try:
+                cursor = conn.execute(
+                    """
+                    SELECT book FROM identifiers
+                    WHERE type = 'koreader'
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (limit,),
+                )
                 for r in cursor.fetchall():
-                    b = self.get_book_by_id(r["id"])
+                    bid = r["book"]
+                    if bid not in seen_ids:
+                        seen_ids.add(bid)
+                        b = self.get_book_by_id(bid)
+                        if b:
+                            books.append(b)
+            except Exception as e:
+                logger.debug(f"Could not query identifiers for koreader hashes: {e}")
+
+            # 3. Recently modified/added books in Calibre
+            cursor = conn.execute("SELECT id FROM books ORDER BY last_modified DESC LIMIT ?", (limit,))
+            for r in cursor.fetchall():
+                bid = r["id"]
+                if bid not in seen_ids:
+                    seen_ids.add(bid)
+                    b = self.get_book_by_id(bid)
                     if b:
                         books.append(b)
 
@@ -432,7 +481,11 @@ class CalibreDbClient(BaseSyncClient):
                 )
 
             # 5. Update book last_modified
-            conn.execute("UPDATE books SET last_modified = ? WHERE id = ?", (now_iso, book_id))
+            try:
+                conn.execute("UPDATE books SET last_modified = ? WHERE id = ?", (now_iso, book_id))
+            except Exception as e:
+                logger.warning(f"Could not update last_modified on books for book #{book_id}: {e}")
+
             conn.commit()
 
             logger.info(f"Updated Calibre DB book ID {book_id}: progress={round(percentage * 100, 1)}%")

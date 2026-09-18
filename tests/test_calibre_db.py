@@ -70,6 +70,12 @@ def create_mock_calibre_db(library_dir: Path) -> Path:
         INSERT INTO authors (id, name) VALUES (2, 'J.R.R. Tolkien');
         INSERT INTO books_authors_link (book, author) VALUES (2, 2);
         INSERT INTO data (book, format, name) VALUES (2, 'EPUB', 'The Hobbit - J.R.R. Tolkien');
+
+        -- Add Calibre-like triggers that call title_sort and uuid4
+        CREATE TRIGGER books_update_trg AFTER UPDATE ON books
+        BEGIN
+            UPDATE books SET title=title_sort(NEW.title) WHERE id=NEW.id AND OLD.title <> NEW.title;
+        END;
     """)
     conn.commit()
     conn.close()

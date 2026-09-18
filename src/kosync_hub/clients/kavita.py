@@ -189,8 +189,8 @@ class KavitaClient(BaseSyncClient):
 
         # Process REST series items
         for s in series_items:
-            series_id = s.get("id")
-            series_name = s.get("name", "Unknown")
+            series_id = s.get("seriesId") or s.get("id")
+            series_name = s.get("seriesName") or s.get("name", "Unknown")
             folder_path = s.get("folderPath") or s.get("lowestFolderPath") or ""
 
             if not series_id:
@@ -265,33 +265,49 @@ class KavitaClient(BaseSyncClient):
                                 f"[Calibre ID: #{calibre_id}, Progress: {round(pct * 100, 1)}%]"
                             )
 
+        # 2. If no matching items found from REST, try OPDS fallback
+        if not recent_reads:
+            logger.info("No recent reads found via REST series. Trying OPDS on-deck feed...")
+            opds_reads = await self._fetch_recent_from_opds()
+            for r in opds_reads:
+                if r.calibre_id not in seen_calibre_ids:
+                    seen_calibre_ids.add(r.calibre_id)
+                    recent_reads.append(r)
+
         logger.info(f"Retrieved {len(recent_reads)} recent read items with Calibre IDs from Kavita.")
         return recent_reads
 
     async def _fetch_recent_series_from_rest(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Queries multiple Kavita REST endpoints to collect recent or currently reading series."""
         headers = self._get_rest_headers()
-        params = {
-            "PageNumber": 1,
-            "pageNumber": 1,
-            "PageSize": limit,
-            "pageSize": limit,
-            "libraryId": 0,
-            "LibraryId": 0,
-        }
 
         all_series: List[Dict[str, Any]] = []
         seen_ids = set()
 
         endpoints = [
-            ("POST", f"{self.raw_base_url}/api/Series/on-deck", "On-Deck (POST)"),
-            ("GET", f"{self.raw_base_url}/api/Series/currently-reading", "Currently Reading (GET)"),
-            ("POST", f"{self.raw_base_url}/api/Series/recently-updated-series", "Recently Updated (POST)"),
+            (
+                "POST",
+                f"{self.raw_base_url}/api/Series/on-deck",
+                "On-Deck (POST)",
+                {"PageNumber": 1, "pageNumber": 1, "PageSize": limit, "pageSize": limit, "libraryId": 0, "LibraryId": 0},
+            ),
+            (
+                "GET",
+                f"{self.raw_base_url}/api/Series/currently-reading",
+                "Currently Reading (GET)",
+                {"PageNumber": 1, "pageNumber": 1, "PageSize": limit, "pageSize": limit},
+            ),
+            (
+                "POST",
+                f"{self.raw_base_url}/api/Series/recently-updated-series",
+                "Recently Updated (POST)",
+                {"PageNumber": 1, "pageNumber": 1, "PageSize": limit, "pageSize": limit},
+            ),
         ]
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                for method, url, label in endpoints:
+                for method, url, label, params in endpoints:
                     try:
                         if method == "POST":
                             res = await client.post(url, params=params, headers=headers)
@@ -305,12 +321,13 @@ class KavitaClient(BaseSyncClient):
                             if isinstance(data, list):
                                 logger.info(f"Kavita {label} returned {len(data)} items.")
                                 for item in data:
-                                    # Might be a grouped series or standard series
-                                    sid = item.get("id") or item.get("seriesId")
+                                    sid = item.get("seriesId") or item.get("id")
+                                    sname = item.get("seriesName") or item.get("name")
                                     if sid and sid not in seen_ids:
                                         seen_ids.add(sid)
-                                        if "id" not in item and sid:
-                                            item["id"] = sid
+                                        item["id"] = sid
+                                        if sname:
+                                            item["name"] = sname
                                         all_series.append(item)
                         else:
                             logger.warning(
