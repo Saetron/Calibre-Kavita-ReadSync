@@ -1,0 +1,29 @@
+services:
+  kosync-hub:
+    build: .
+    container_name: kosync-hub
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Optional environment variable overrides
+      - KAVITA_URL=http://kavita:5000
+      - KAVITA_API_KEY=YOUR_KAVITA_API_KEY
+      - CALIBRE_LIBRARY_PATH=/calibre/library
+      - SYNC_INTERVAL_SECONDS=300
+    volumes:
+      # Persistent state and audit history
+      - kosync_data:/app/data
+      # Mount your Calibre library directory (where metadata.db is located)
+      # e.g., if using linuxserver/calibre, point to your library path:
+      - /path/to/your/calibre/library:/calibre/library:rw
+      # Configuration file
+      - ./config.yaml:/app/config/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  kosync_data:

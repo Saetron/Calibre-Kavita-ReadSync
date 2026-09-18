@@ -1,0 +1,43 @@
+# ==============================================================================
+# KOReader Multi-Sync Hub Configuration
+# ==============================================================================
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  # Optional: If you want to require specific credentials in KOReader's Register/Login menu.
+  # If left commented out, any username/password entered in KOReader is accepted.
+  # auth_username: "myuser"
+  # auth_password: "mypassword"
+
+kavita:
+  enabled: true
+  # Kavita base URL (reachable from kosync-hub)
+  base_url: "http://kavita:5000"
+  # Your Kavita user API key (Kavita Web -> User Settings -> API Keys)
+  api_key: "YOUR_KAVITA_API_KEY_HERE"
+  timeout: 10.0
+
+calibre:
+  enabled: true
+  # Path to your Calibre library directory (containing metadata.db and book folders)
+  library_path: "/calibre/library"
+  # Custom column lookup names (prefixed with '#')
+  read_pct_column: "#read_pct"            # Stores float reading percentage (e.g. 45.5%)
+  read_status_column: "#read_status"      # Stores boolean (Yes/No) if book is read
+  last_read_column: "#last_read"          # Stores timestamp of last reading activity
+  progress_column: "#koreader_progress"   # Stores exact KOReader progress string/CFI
+  # Automatically create the custom columns in metadata.db if they don't exist yet
+  auto_create_columns: true
+  # Mark read status as true when percentage reaches or exceeds this threshold (0.98 = 98%)
+  mark_read_threshold: 0.98
+
+sync:
+  # Background sync frequency in seconds (default: 300 = 5 minutes)
+  interval_seconds: 300
+  # Conflict resolution strategy: 'latest_timestamp' (recommended) or 'highest_percentage'
+  conflict_resolution: "latest_timestamp"
+  # On startup, scan the Calibre library and index KOReader partial MD5 hashes
+  scan_on_startup: true
+
+data_dir: "/app/data"
