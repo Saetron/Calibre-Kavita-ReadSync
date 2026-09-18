@@ -21,6 +21,15 @@ from .synchronizer import Synchronizer
 console = Console()
 
 
+def get_config(ctx: click.Context, config_path: Optional[str] = None) -> AppConfig:
+    """Resolves configuration from command option or context."""
+    if config_path:
+        return load_config(config_path)
+    if ctx.obj and "config" in ctx.obj and ctx.obj["config"]:
+        return ctx.obj["config"]
+    return load_config(None)
+
+
 def init_components(config: AppConfig):
     """Initializes database, clients, and synchronizer from configuration."""
     db_file = Path(config.data_dir) / "kosync_hub.sqlite3"
@@ -70,11 +79,12 @@ def cli(ctx, config_path: Optional[str]):
     ctx.obj["config"] = load_config(config_path)
 
 
-@cli.command()
+@cli.command("serve")
+@click.option("--config", "-c", "config_path", help="Path to config.yaml file.")
 @click.pass_context
-def serve(ctx):
+def serve(ctx, config_path: Optional[str] = None):
     """Starts the KOReader sync server and background synchronizer."""
-    config: AppConfig = ctx.obj["config"]
+    config: AppConfig = get_config(ctx, config_path)
     db, kavita, calibre, sync = init_components(config)
 
     console.print(f"[bold cyan]Starting KOReader Multi-Sync Hub on {config.server.host}:{config.server.port}[/bold cyan]")
@@ -83,17 +93,19 @@ def serve(ctx):
 
 
 @cli.command("run")
+@click.option("--config", "-c", "config_path", help="Path to config.yaml file.")
 @click.pass_context
-def run(ctx):
+def run(ctx, config_path: Optional[str] = None):
     """Runs the bidirectional sync daemon in the foreground."""
-    ctx.invoke(serve)
+    serve.callback(config_path=config_path)
 
 
 @cli.command("sync-now")
+@click.option("--config", "-c", "config_path", help="Path to config.yaml file.")
 @click.pass_context
-def sync_now(ctx):
+def sync_now(ctx, config_path: Optional[str] = None):
     """Performs an immediate one-shot synchronization pass between Kavita and Calibre."""
-    config: AppConfig = ctx.obj["config"]
+    config: AppConfig = get_config(ctx, config_path)
     _, _, _, sync = init_components(config)
 
     async def _run():
@@ -108,10 +120,11 @@ def sync_now(ctx):
 
 
 @cli.command("test-connections")
+@click.option("--config", "-c", "config_path", help="Path to config.yaml file.")
 @click.pass_context
-def test_connections(ctx):
+def test_connections(ctx, config_path: Optional[str] = None):
     """Verifies credentials and connectivity to Kavita and Calibre."""
-    config: AppConfig = ctx.obj["config"]
+    config: AppConfig = get_config(ctx, config_path)
     _, kavita, calibre, _ = init_components(config)
 
     async def _test():
@@ -120,9 +133,9 @@ def test_connections(ctx):
             with console.status("Checking Kavita API..."):
                 ok = await kavita.test_connection()
             if ok:
-                console.print(f"[green]✔ Kavita:[/green] Successfully connected to {kavita.endpoint_url}")
+                console.print(f"[green]✔ Kavita:[/green] Successfully connected to {kavita.koreader_url}")
             else:
-                console.print(f"[red]✖ Kavita:[/red] Failed to connect/authenticate at {kavita.endpoint_url}")
+                console.print(f"[red]✖ Kavita:[/red] Failed to connect/authenticate at {kavita.koreader_url}")
         else:
             console.print("[yellow]– Kavita:[/yellow] Disabled in config")
 
@@ -141,10 +154,11 @@ def test_connections(ctx):
 
 @cli.command("scan-calibre")
 @click.option("--limit", "-l", default=None, type=int, help="Limit number of books to scan.")
+@click.option("--config", "-c", "config_path", help="Path to config.yaml file.")
 @click.pass_context
-def scan_calibre(ctx, limit: Optional[int]):
+def scan_calibre(ctx, limit: Optional[int], config_path: Optional[str] = None):
     """Scans the Calibre library, generates KOReader hashes, and indexes them."""
-    config: AppConfig = ctx.obj["config"]
+    config: AppConfig = get_config(ctx, config_path)
     _, _, calibre, _ = init_components(config)
 
     if not calibre:
@@ -158,15 +172,16 @@ def scan_calibre(ctx, limit: Optional[int]):
 
 
 @cli.command("status")
+@click.option("--config", "-c", "config_path", help="Path to config.yaml file.")
 @click.pass_context
-def status(ctx):
+def status(ctx, config_path: Optional[str] = None):
     """Displays tracked books and synchronization status."""
-    config: AppConfig = ctx.obj["config"]
+    config: AppConfig = get_config(ctx, config_path)
     db, _, _, _ = init_components(config)
 
     docs = db.get_all_tracked_documents()
     if not docs:
-        console.print("[yellow]No books have been tracked yet. Point your KOReader device to this server or read a book![/yellow]")
+        console.print("[yellow]No books have been tracked yet. Start reading in KOReader or Kavita![/yellow]")
         return
 
     table = Table(title="Tracked Books & Reading Progress")
