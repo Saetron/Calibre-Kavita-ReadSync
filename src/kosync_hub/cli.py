@@ -68,13 +68,17 @@ def init_components(config: AppConfig):
 
 @click.group()
 @click.option("--config", "-c", "config_path", help="Path to config.yaml file.")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose debug logging.")
 @click.pass_context
-def cli(ctx, config_path: Optional[str]):
+def cli(ctx, config_path: Optional[str], verbose: bool = False):
     """KOReader Multi-Sync Hub: Sync reading progress between Kavita and Calibre."""
+    log_level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    if verbose:
+        logging.getLogger("kosync_hub").setLevel(logging.DEBUG)
     ctx.ensure_object(dict)
     ctx.obj["config"] = load_config(config_path)
 
@@ -123,17 +127,26 @@ def sync_now(ctx, config_path: Optional[str] = None):
 @click.option("--config", "-c", "config_path", help="Path to config.yaml file.")
 @click.pass_context
 def test_connections(ctx, config_path: Optional[str] = None):
-    """Verifies credentials and connectivity to Kavita and Calibre."""
+    """Verifies credentials, connectivity, and book discovery for Kavita and Calibre."""
     config: AppConfig = get_config(ctx, config_path)
     _, kavita, calibre, _ = init_components(config)
 
     async def _test():
         console.print("\n[bold]Testing Service Connections:[/bold]")
         if kavita:
-            with console.status("Checking Kavita API..."):
+            with console.status("Checking Kavita API & Recent Reads..."):
                 ok = await kavita.test_connection()
+                reads = await kavita.get_on_deck_reads() if ok else []
             if ok:
-                console.print(f"[green]✔ Kavita:[/green] Successfully connected to {kavita.koreader_url}")
+                console.print(f"[green]✔ Kavita:[/green] Connected to {kavita.koreader_url}")
+                jwt_status = "active (Bearer JWT)" if kavita.jwt_token else "fallback (x-api-key)"
+                console.print(f"  [dim]Authentication mode: {jwt_status}[/dim]")
+                console.print(f"  [cyan]Recent Reads Discovered:[/cyan] {len(reads)} book(s) with Calibre IDs")
+                for r in reads:
+                    console.print(
+                        f"    • [bold]{r.series_name}[/bold] -> Calibre ID: [blue]#{r.calibre_id}[/blue] "
+                        f"({round(r.percentage * 100, 1)}% read)"
+                    )
             else:
                 console.print(f"[red]✖ Kavita:[/red] Failed to connect/authenticate at {kavita.koreader_url}")
         else:
@@ -144,6 +157,13 @@ def test_connections(ctx, config_path: Optional[str] = None):
                 ok = await calibre.test_connection()
             if ok:
                 console.print(f"[green]✔ Calibre DB:[/green] Successfully connected to {calibre.db_path}")
+                recent_calibre = calibre.get_recently_read_books(limit=5)
+                console.print(f"  [cyan]Calibre Books with Progress:[/cyan] {len(recent_calibre)} recent book(s)")
+                for b in recent_calibre:
+                    console.print(
+                        f"    • [bold]{b.title}[/bold] -> ID: [blue]#{b.book_id}[/blue] "
+                        f"({round(b.percentage * 100, 1)}% read)"
+                    )
             else:
                 console.print(f"[red]✖ Calibre DB:[/red] Failed to open database at {calibre.db_path}")
         else:

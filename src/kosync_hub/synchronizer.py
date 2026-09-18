@@ -139,6 +139,53 @@ class Synchronizer:
                         )
                     )
 
+        # Also check Calibre's recent books that have KOReader hashes directly against Kavita KOReader endpoint
+        calibre_recent = self.calibre.get_recently_read_books(limit=30)
+        checked_calibre_ids = {r.calibre_id for r in recent_reads if r.calibre_id is not None}
+        for book in calibre_recent:
+            if book.book_id in checked_calibre_ids:
+                continue
+            hsh = book.koreader_hash or self.calibre.get_or_compute_koreader_hash(book.book_id)
+            if not hsh:
+                continue
+            ko_rec = await self.kavita.get_progress(hsh)
+            if ko_rec and (
+                ko_rec.percentage > book.percentage
+                or (ko_rec.percentage == book.percentage and ko_rec.percentage > 0 and book.koreader_progress != ko_rec.progress)
+            ):
+                logger.info(
+                    f"Syncing from Kavita KOReader endpoint to Calibre for book #{book.book_id} ('{book.title}'): "
+                    f"{round(book.percentage * 100, 1)}% -> {round(ko_rec.percentage * 100, 1)}%"
+                )
+                ok = self.calibre.update_book_progress(
+                    book_id=book.book_id,
+                    percentage=ko_rec.percentage,
+                    progress_str=ko_rec.progress,
+                    timestamp=ko_rec.timestamp,
+                )
+                if ok:
+                    updated_count += 1
+                    self.db.upsert_progress(
+                        record=ko_rec,
+                        calibre_book_id=book.book_id,
+                        kavita_synced_at=ko_rec.timestamp,
+                        calibre_synced_at=ko_rec.timestamp,
+                        sync_status="synced_to_calibre",
+                    )
+                    self.db.log_sync_event(
+                        SyncEvent(
+                            document=hsh,
+                            calibre_id=book.book_id,
+                            source="kavita_koreader_endpoint",
+                            target="calibre",
+                            progress=ko_rec.progress,
+                            percentage=ko_rec.percentage,
+                            timestamp=ko_rec.timestamp,
+                            success=True,
+                            message=f"Synced KOReader progress from Kavita to Calibre #{book.book_id} ({round(ko_rec.percentage * 100, 1)}%)",
+                        )
+                    )
+
         return updated_count
 
     async def sync_calibre_to_kavita(self) -> int:

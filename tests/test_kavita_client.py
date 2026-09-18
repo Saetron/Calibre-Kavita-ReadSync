@@ -17,9 +17,11 @@ async def test_kavita_client_koreader_and_ondeck(monkeypatch):
     kavita = KavitaClient(base_url="http://kavita.test:5000", api_key="secret_token")
 
     def mock_handler(request: httpx.Request):
-        url_str = str(request.url)
+        url_str = str(request.url).lower()
         if url_str.endswith("/users/auth"):
             return httpx.Response(200, json={"message": "Authorized"})
+        elif url_str.endswith("/api/plugin/authenticate") or "/api/plugin/authenticate" in url_str:
+            return httpx.Response(200, json={"token": "mock_jwt_token", "username": "testuser"})
         elif "/syncs/progress/dune_hash" in url_str and request.method == "GET":
             return httpx.Response(200, json={
                 "document": "dune_hash",
@@ -34,7 +36,7 @@ async def test_kavita_client_koreader_and_ondeck(monkeypatch):
             return httpx.Response(200, json=[
                 {"id": 10, "name": "The Hobbit Series"}
             ])
-        elif "/api/series/volumes" in url_str and "seriesId=10" in url_str:
+        elif "/api/series/volumes" in url_str and "seriesid=10" in url_str:
             return httpx.Response(200, json=[
                 {
                     "id": 100,
@@ -85,3 +87,41 @@ async def test_kavita_client_koreader_and_ondeck(monkeypatch):
     assert recent_reads[0].calibre_id == 42
     assert recent_reads[0].percentage == 0.5  # 150 / 300
     assert recent_reads[0].filename == "The Hobbit {42}.epub"
+
+
+@pytest.mark.asyncio
+async def test_kavita_opds_fallback(monkeypatch):
+    kavita = KavitaClient(base_url="http://kavita.test:5000", api_key="secret_token")
+
+    opds_xml = """<?xml version="1.0" encoding="utf-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <title>On Deck</title>
+      <entry>
+        <title>Neuromancer {77}</title>
+        <link href="/api/reader/77/file" type="application/epub+zip" title="Neuromancer {77}.epub" />
+      </entry>
+    </feed>
+    """
+
+    def mock_handler(request: httpx.Request):
+        url_str = str(request.url).lower()
+        if "/api/plugin/authenticate" in url_str:
+            return httpx.Response(200, json={"token": "jwt123"})
+        if "/api/opds/secret_token/on-deck" in url_str:
+            return httpx.Response(200, text=opds_xml)
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(mock_handler)
+    original_init = httpx.AsyncClient.__init__
+
+    def mock_init(self, *args, **kwargs):
+        kwargs["transport"] = transport
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", mock_init)
+
+    reads = await kavita.get_on_deck_reads()
+    assert len(reads) == 1
+    assert reads[0].calibre_id == 77
+    assert "Neuromancer" in reads[0].series_name
+

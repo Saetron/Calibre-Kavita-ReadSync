@@ -117,5 +117,7 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
     # Data dir
     if data_dir := (os.getenv("DATA_DIR") or os.getenv("KOSYNC_DATA_DIR")):
         config.data_dir = data_dir
+    elif config.data_dir == "/app/data" and not Path("/app").is_dir():
+        config.data_dir = "./data"
 
     return config
