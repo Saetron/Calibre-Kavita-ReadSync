@@ -239,6 +239,12 @@ class InternalDatabase:
                 return None
             return dict(row)
 
+    def delete_mapping(self, calibre_id: int):
+        """Removes cached Kavita metadata mapping for a Calibre book ID."""
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM book_mappings WHERE calibre_id = ?", (calibre_id,))
+            conn.commit()
+
     def save_mapping(
         self,
         calibre_id: int,

@@ -181,3 +181,80 @@ async def test_kavita_db_mapping_cache(tmp_path):
     assert meta["series_name"] == "Cached Series"
     assert meta["pages"] == 450
 
+
+@pytest.mark.asyncio
+async def test_kavita_id_changed_after_book_update(tmp_path, monkeypatch):
+    """
+    Tests that if a book was updated in Kavita and its old chapter ID returns 404,
+    the client purges the stale cache, re-queries Kavita, gets the new ID, and succeeds.
+    """
+    from kosync_hub.db import InternalDatabase
+    db = InternalDatabase(str(tmp_path / "stale_test.db"))
+
+    # Populate stale mapping (old chapter ID: 101, old series ID: 10)
+    db.save_mapping(
+        calibre_id=500,
+        kavita_series_id=10,
+        kavita_volume_id=20,
+        kavita_chapter_id=101,
+        pages=200,
+    )
+
+    kavita = KavitaClient(base_url="http://kavita.test:5000", api_key="secret_token", db=db)
+
+    def mock_handler(request: httpx.Request):
+        url_str = str(request.url).lower()
+        if "/api/plugin/authenticate" in url_str:
+            return httpx.Response(200, json={"token": "jwt123"})
+        # Old chapter ID 101 returns 404 (deleted/updated in Kavita)
+        if "/api/reader/mark-chapter-read" in url_str:
+            import json
+            body = json.loads(request.content.decode("utf-8"))
+            if body.get("chapterId") == 101:
+                return httpx.Response(404, json={"message": "Chapter not found"})
+            elif body.get("chapterId") == 202:
+                # New chapter ID 202 succeeds!
+                return httpx.Response(200, json={"message": "Marked read"})
+        # Re-discovery search query
+        if "/api/search/search" in url_str:
+            return httpx.Response(200, json={
+                "files": [{"id": 5, "filePath": "/books/Updated Book {500}.epub", "pages": 250}],
+                "chapters": [],
+                "series": [],
+            })
+        if "/api/search/series-for-mangafile" in url_str:
+            return httpx.Response(200, json={"id": 10, "name": "Updated Book Series", "libraryId": 1})
+        if "/api/series/volumes" in url_str:
+            return httpx.Response(200, json=[
+                {
+                    "id": 20,
+                    "chapters": [
+                        {
+                            "id": 202,  # New chapter ID
+                            "title": "Updated Chapter",
+                            "files": [{"id": 5, "filePath": "/books/Updated Book {500}.epub"}],
+                            "pages": 250,
+                        }
+                    ]
+                }
+            ])
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(mock_handler)
+    original_init = httpx.AsyncClient.__init__
+
+    def mock_init(self, *args, **kwargs):
+        kwargs["transport"] = transport
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", mock_init)
+
+    # Calling update_webui_progress will hit 404 on chapter 101, re-discover chapter 202, and succeed
+    ok = await kavita.update_webui_progress(calibre_id=500, percentage=1.0, title="Updated Book")
+    assert ok is True
+
+    # Verify that the DB now contains the new chapter ID 202
+    updated_mapping = db.get_mapping_by_calibre_id(500)
+    assert updated_mapping is not None
+    assert updated_mapping["kavita_chapter_id"] == 202
+

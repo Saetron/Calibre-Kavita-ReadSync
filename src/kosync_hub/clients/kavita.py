@@ -165,27 +165,37 @@ class KavitaClient(BaseSyncClient):
 
         return ko_ok
 
+    def invalidate_mapping(self, calibre_id: int):
+        """Invalidates in-memory and database cached mappings for a Calibre ID."""
+        self._calibre_id_to_kavita.pop(calibre_id, None)
+        if self.db and hasattr(self.db, "delete_mapping"):
+            self.db.delete_mapping(calibre_id)
+
     async def find_kavita_metadata_by_calibre_id(
-        self, calibre_id: int, title: Optional[str] = None
+        self,
+        calibre_id: int,
+        title: Optional[str] = None,
+        force_refresh: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Finds series, volume, and chapter IDs in Kavita for a given Calibre ID."""
-        if calibre_id in self._calibre_id_to_kavita:
-            return self._calibre_id_to_kavita[calibre_id]
+        if not force_refresh:
+            if calibre_id in self._calibre_id_to_kavita:
+                return self._calibre_id_to_kavita[calibre_id]
 
-        # Check internal database mapping cache
-        if self.db and hasattr(self.db, "get_mapping_by_calibre_id"):
-            cached = self.db.get_mapping_by_calibre_id(calibre_id)
-            if cached and cached.get("kavita_series_id"):
-                res_meta = {
-                    "series_id": cached.get("kavita_series_id"),
-                    "series_name": cached.get("kavita_series_name"),
-                    "library_id": cached.get("kavita_library_id"),
-                    "chapter_id": cached.get("kavita_chapter_id"),
-                    "volume_id": cached.get("kavita_volume_id"),
-                    "pages": cached.get("pages"),
-                }
-                self._calibre_id_to_kavita[calibre_id] = res_meta
-                return res_meta
+            # Check internal database mapping cache
+            if self.db and hasattr(self.db, "get_mapping_by_calibre_id"):
+                cached = self.db.get_mapping_by_calibre_id(calibre_id)
+                if cached and cached.get("kavita_series_id"):
+                    res_meta = {
+                        "series_id": cached.get("kavita_series_id"),
+                        "series_name": cached.get("kavita_series_name"),
+                        "library_id": cached.get("kavita_library_id"),
+                        "chapter_id": cached.get("kavita_chapter_id"),
+                        "volume_id": cached.get("kavita_volume_id"),
+                        "pages": cached.get("pages"),
+                    }
+                    self._calibre_id_to_kavita[calibre_id] = res_meta
+                    return res_meta
 
         headers = self._get_rest_headers()
         queries = [f"{{{calibre_id}}}", str(calibre_id)]
@@ -348,6 +358,7 @@ class KavitaClient(BaseSyncClient):
         calibre_id: int,
         percentage: float,
         title: Optional[str] = None,
+        retry_count: int = 0,
     ) -> bool:
         """
         Updates the reading progress in Kavita's WebUI for the authenticated user.
@@ -355,10 +366,12 @@ class KavitaClient(BaseSyncClient):
           NEVER marks the whole series as read, preventing unread books in the series from being finished.
         - If percentage <= 0.0: resets chapter page progress to 0.
         - If 0 < percentage < 0.98: saves current page progress via /api/Reader/progress.
+        - Automatically invalidates cache and re-discovers if Kavita IDs change (e.g. after book update).
         """
         await self.ensure_authenticated()
 
-        meta = await self.find_kavita_metadata_by_calibre_id(calibre_id, title)
+        force_refresh = (retry_count > 0)
+        meta = await self.find_kavita_metadata_by_calibre_id(calibre_id, title, force_refresh=force_refresh)
         if not meta:
             logger.info(
                 f"Could not locate series in Kavita for Calibre ID #{calibre_id} ('{title or ''}') to update WebUI."
@@ -420,6 +433,18 @@ class KavitaClient(BaseSyncClient):
                             f"Marked chapter #{chapter_id} in series #{series_id} ('{meta.get('series_name')}') as READ in Kavita WebUI."
                         )
                         return True
+                    elif res.status_code in (400, 404) and retry_count == 0:
+                        logger.info(
+                            f"Kavita mark-chapter-read returned {res.status_code} for Calibre #{calibre_id}. "
+                            f"Kavita IDs may have changed after book update. Invalidating cache and retrying..."
+                        )
+                        self.invalidate_mapping(calibre_id)
+                        return await self.update_webui_progress(
+                            calibre_id=calibre_id,
+                            percentage=percentage,
+                            title=title,
+                            retry_count=1,
+                        )
                     else:
                         logger.warning(f"Kavita mark-chapter-read returned status {res.status_code}: {res.text[:100]}")
                         return False
@@ -437,6 +462,14 @@ class KavitaClient(BaseSyncClient):
                         "pageNum": 0,
                     }
                     res = await client.post(url, json=payload, headers=headers)
+                    if res.status_code in (400, 404) and retry_count == 0:
+                        self.invalidate_mapping(calibre_id)
+                        return await self.update_webui_progress(
+                            calibre_id=calibre_id,
+                            percentage=percentage,
+                            title=title,
+                            retry_count=1,
+                        )
                     return res.status_code in (200, 201, 204)
 
                 # 3. Partial progress -> Save page progress in Kavita WebUI
@@ -461,6 +494,18 @@ class KavitaClient(BaseSyncClient):
                             f"page {page_num}/{total_pages} ({round(percentage * 100, 1)}%)"
                         )
                         return True
+                    elif res.status_code in (400, 404) and retry_count == 0:
+                        logger.info(
+                            f"Kavita save progress returned {res.status_code} for Calibre #{calibre_id}. "
+                            f"Kavita IDs may have changed after book update. Invalidating cache and retrying..."
+                        )
+                        self.invalidate_mapping(calibre_id)
+                        return await self.update_webui_progress(
+                            calibre_id=calibre_id,
+                            percentage=percentage,
+                            title=title,
+                            retry_count=1,
+                        )
                     else:
                         logger.warning(f"Kavita save progress returned status {res.status_code}: {res.text[:100]}")
 
