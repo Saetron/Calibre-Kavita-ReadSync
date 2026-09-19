@@ -214,13 +214,31 @@ class KavitaClient(BaseSyncClient):
                                 sid = s_data.get("id")
                                 lid = s_data.get("libraryId")
                                 sname = s_data.get("name")
+
+                                # Isolate exact chapter_id and volume_id
+                                vol_id = None
+                                chap_id = None
+                                pages = f.get("pages")
+                                vols = await self._fetch_series_volumes(sid)
+                                for v in vols:
+                                    v_id = v.get("id")
+                                    for ch in v.get("chapters", []):
+                                        c_files = ch.get("files", [])
+                                        if any(cf.get("id") == fid or cf.get("filePath") == fp or extract_calibre_id(cf.get("filePath", "")) == calibre_id for cf in c_files):
+                                            vol_id = v_id
+                                            chap_id = ch.get("id")
+                                            pages = ch.get("pages") or pages
+                                            break
+                                    if chap_id:
+                                        break
+
                                 res_meta = {
                                     "series_id": sid,
                                     "series_name": sname,
                                     "library_id": lid,
-                                    "chapter_id": None,
-                                    "volume_id": None,
-                                    "pages": f.get("pages"),
+                                    "chapter_id": chap_id,
+                                    "volume_id": vol_id,
+                                    "pages": pages,
                                 }
                                 self._calibre_id_to_kavita[calibre_id] = res_meta
                                 if self.db and hasattr(self.db, "save_mapping"):
@@ -228,8 +246,10 @@ class KavitaClient(BaseSyncClient):
                                         calibre_id=calibre_id,
                                         kavita_series_id=sid,
                                         kavita_series_name=sname,
+                                        kavita_volume_id=vol_id,
+                                        kavita_chapter_id=chap_id,
                                         kavita_library_id=lid,
-                                        pages=f.get("pages"),
+                                        pages=pages,
                                         title=title,
                                         filename=fp,
                                     )
@@ -265,13 +285,44 @@ class KavitaClient(BaseSyncClient):
                         s_name = s.get("name") or ""
                         sid = s.get("seriesId") or s.get("id")
                         if extract_calibre_id(s_name) == calibre_id or (title and title.lower() in s_name.lower()):
+                            lid = s.get("libraryId")
+                            vol_id = None
+                            chap_id = None
+                            pages = None
+                            vols = await self._fetch_series_volumes(sid)
+                            # Try to match the specific chapter for this calibre_id or title
+                            for v in vols:
+                                v_id = v.get("id")
+                                for ch in v.get("chapters", []):
+                                    c_files = ch.get("files", [])
+                                    ch_title = ch.get("title") or ch.get("titleName") or ""
+                                    if (
+                                        any(extract_calibre_id(cf.get("filePath", "")) == calibre_id for cf in c_files)
+                                        or extract_calibre_id(ch_title) == calibre_id
+                                        or (title and title.lower() == ch_title.lower())
+                                    ):
+                                        vol_id = v_id
+                                        chap_id = ch.get("id")
+                                        pages = ch.get("pages")
+                                        break
+                                if chap_id:
+                                    break
+
+                            # If only 1 volume with exactly 1 chapter in series (standalone book)
+                            if not chap_id and len(vols) == 1:
+                                chaps = vols[0].get("chapters", [])
+                                if len(chaps) == 1:
+                                    vol_id = vols[0].get("id")
+                                    chap_id = chaps[0].get("id")
+                                    pages = chaps[0].get("pages")
+
                             res_meta = {
                                 "series_id": sid,
                                 "series_name": s_name,
-                                "library_id": s.get("libraryId"),
-                                "chapter_id": None,
-                                "volume_id": None,
-                                "pages": None,
+                                "library_id": lid,
+                                "chapter_id": chap_id,
+                                "volume_id": vol_id,
+                                "pages": pages,
                             }
                             self._calibre_id_to_kavita[calibre_id] = res_meta
                             if self.db and hasattr(self.db, "save_mapping"):
@@ -279,7 +330,10 @@ class KavitaClient(BaseSyncClient):
                                     calibre_id=calibre_id,
                                     kavita_series_id=sid,
                                     kavita_series_name=s_name,
-                                    kavita_library_id=s.get("libraryId"),
+                                    kavita_volume_id=vol_id,
+                                    kavita_chapter_id=chap_id,
+                                    kavita_library_id=lid,
+                                    pages=pages,
                                     title=title,
                                 )
                             return res_meta
@@ -297,8 +351,9 @@ class KavitaClient(BaseSyncClient):
     ) -> bool:
         """
         Updates the reading progress in Kavita's WebUI for the authenticated user.
-        - If percentage >= 0.98: marks the series / chapter as read via /api/Reader/mark-read.
-        - If percentage <= 0.0: marks as unread via /api/Reader/mark-unread.
+        - If percentage >= 0.98: marks ONLY the specific chapter as read via /api/Reader/mark-chapter-read.
+          NEVER marks the whole series as read, preventing unread books in the series from being finished.
+        - If percentage <= 0.0: resets chapter page progress to 0.
         - If 0 < percentage < 0.98: saves current page progress via /api/Reader/progress.
         """
         await self.ensure_authenticated()
@@ -316,55 +371,79 @@ class KavitaClient(BaseSyncClient):
         library_id = meta.get("library_id")
         total_pages = meta.get("pages") or 100
 
+        # If chapter_id or volume_id missing, try resolving from series volumes
+        if not chapter_id or not volume_id:
+            volumes = await self._fetch_series_volumes(series_id)
+            for vol in volumes:
+                v_id = vol.get("id")
+                for ch in vol.get("chapters", []):
+                    c_files = ch.get("files", [])
+                    ch_title = ch.get("title") or ch.get("titleName") or ""
+                    if (
+                        any(extract_calibre_id(cf.get("filePath", "")) == calibre_id for cf in c_files)
+                        or extract_calibre_id(ch_title) == calibre_id
+                        or (title and title.lower() == ch_title.lower())
+                    ):
+                        volume_id = v_id
+                        chapter_id = ch.get("id")
+                        total_pages = ch.get("pages") or total_pages
+                        break
+                if chapter_id:
+                    break
+
+            # Fallback ONLY if series contains exactly 1 volume with exactly 1 chapter (standalone book)
+            if not chapter_id and len(volumes) == 1:
+                chaps = volumes[0].get("chapters", [])
+                if len(chaps) == 1:
+                    volume_id = volumes[0].get("id")
+                    chapter_id = chaps[0].get("id")
+                    total_pages = chaps[0].get("pages") or total_pages
+
         headers = self._get_rest_headers()
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                # 1. 98%+ finished -> Mark as Read in Kavita WebUI
+                # 1. 98%+ finished -> Mark ONLY the specific chapter as read
                 if percentage >= 0.98:
-                    url = f"{self.raw_base_url}/api/Reader/mark-read"
-                    payload = {"seriesId": series_id, "generateReadingSession": True}
+                    if not chapter_id:
+                        logger.warning(
+                            f"Refusing to mark entire series #{series_id} ('{meta.get('series_name')}') as read "
+                            f"for Calibre #{calibre_id} ('{title}'): exact chapter could not be isolated. "
+                            f"This protects other unread books in the series."
+                        )
+                        return False
+
+                    url = f"{self.raw_base_url}/api/Reader/mark-chapter-read"
+                    payload = {"seriesId": series_id, "chapterId": chapter_id, "generateReadingSession": True}
                     res = await client.post(url, json=payload, headers=headers)
                     if res.status_code in (200, 201, 204):
                         logger.info(
-                            f"Marked series #{series_id} ('{meta.get('series_name')}') as READ in Kavita WebUI."
+                            f"Marked chapter #{chapter_id} in series #{series_id} ('{meta.get('series_name')}') as READ in Kavita WebUI."
                         )
-                        if chapter_id:
-                            ch_url = f"{self.raw_base_url}/api/Reader/mark-chapter-read"
-                            await client.post(
-                                ch_url,
-                                json={"seriesId": series_id, "chapterId": chapter_id, "generateReadingSession": True},
-                                headers=headers,
-                            )
                         return True
                     else:
-                        logger.warning(f"Kavita mark-read returned status {res.status_code}: {res.text[:100]}")
+                        logger.warning(f"Kavita mark-chapter-read returned status {res.status_code}: {res.text[:100]}")
+                        return False
 
-                # 2. 0% -> Mark as Unread
+                # 2. 0% -> Reset progress for the specific chapter (never unmark whole series)
                 elif percentage <= 0.0:
-                    url = f"{self.raw_base_url}/api/Reader/mark-unread"
-                    payload = {"seriesId": series_id, "generateReadingSession": False}
+                    if not chapter_id or not volume_id:
+                        return False
+                    url = f"{self.raw_base_url}/api/Reader/progress"
+                    payload = {
+                        "seriesId": series_id,
+                        "volumeId": volume_id,
+                        "chapterId": chapter_id,
+                        "libraryId": library_id or 1,
+                        "pageNum": 0,
+                    }
                     res = await client.post(url, json=payload, headers=headers)
-                    if res.status_code in (200, 201, 204):
-                        logger.info(f"Marked series #{series_id} as UNREAD in Kavita WebUI.")
-                        return True
+                    return res.status_code in (200, 201, 204)
 
                 # 3. Partial progress -> Save page progress in Kavita WebUI
                 else:
-                    if not chapter_id or not volume_id or not library_id:
-                        volumes = await self._fetch_series_volumes(series_id)
-                        if volumes:
-                            vol = volumes[0]
-                            volume_id = vol.get("id")
-                            chaps = vol.get("chapters", [])
-                            if chaps:
-                                ch = chaps[0]
-                                chapter_id = ch.get("id")
-                                total_pages = ch.get("pages") or total_pages
-                            if not library_id:
-                                library_id = meta.get("library_id") or 1
-
-                    if not library_id:
-                        library_id = 1
+                    if not chapter_id or not volume_id:
+                        logger.debug(f"Skipping Kavita WebUI progress update for #{calibre_id}: chapter not found.")
+                        return False
 
                     page_num = max(1, round(percentage * total_pages))
                     url = f"{self.raw_base_url}/api/Reader/progress"
@@ -372,13 +451,13 @@ class KavitaClient(BaseSyncClient):
                         "seriesId": series_id,
                         "volumeId": volume_id,
                         "chapterId": chapter_id,
-                        "libraryId": library_id,
+                        "libraryId": library_id or 1,
                         "pageNum": page_num,
                     }
                     res = await client.post(url, json=payload, headers=headers)
                     if res.status_code in (200, 201, 204):
                         logger.info(
-                            f"Updated reading progress in Kavita WebUI for series #{series_id} ('{meta.get('series_name')}'): "
+                            f"Updated reading progress in Kavita WebUI for chapter #{chapter_id} (series #{series_id}): "
                             f"page {page_num}/{total_pages} ({round(percentage * 100, 1)}%)"
                         )
                         return True
@@ -438,14 +517,13 @@ class KavitaClient(BaseSyncClient):
 
             # Fetch volume / chapter details for this series
             volumes = await self._fetch_series_volumes(series_id)
-            if not volumes:
-                continue
+            total_series_chapters = sum(len(v.get("chapters", [])) for v in volumes)
 
             for vol in volumes:
                 vol_name = vol.get("name") or ""
-                vol_calibre_id = extract_calibre_id(vol_name) or series_calibre_id
-
                 chapters = vol.get("chapters", [])
+                vol_calibre_id = extract_calibre_id(vol_name) or (series_calibre_id if total_series_chapters == 1 else None)
+
                 for ch in chapters:
                     files = ch.get("files", [])
                     ch_title = ch.get("title") or ch.get("titleName") or ""
@@ -467,7 +545,7 @@ class KavitaClient(BaseSyncClient):
                         calibre_id = (
                             extract_calibre_id(candidate_fn)
                             or extract_calibre_id(ch_title)
-                            or vol_calibre_id
+                            or (vol_calibre_id if len(chapters) == 1 else None)
                         )
 
                         if calibre_id is None:

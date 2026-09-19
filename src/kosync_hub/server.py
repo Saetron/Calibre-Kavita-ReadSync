@@ -42,6 +42,11 @@ def create_app(
             loop = asyncio.get_event_loop()
             loop.run_in_executor(None, synchronizer.calibre.scan_and_index_library)
 
+        # Repair any missing/unknown titles from Calibre DB
+        if synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(None, db.repair_missing_titles, synchronizer.calibre.get_book_by_id)
+
         # Start background sync worker
         asyncio.create_task(synchronizer.start_background_loop())
         try:
@@ -105,6 +110,11 @@ def create_app(
         # If calibre_id found, link the document hash as an alias (for compressed files)
         if calibre_id:
             db.link_document_alias(payload.document, calibre_id, payload.device)
+            if (not title or title == "Unknown" or not authors) and synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
+                cal_b = synchronizer.calibre.get_book_by_id(calibre_id)
+                if cal_b:
+                    title = title or cal_b.title
+                    authors = authors or cal_b.authors
 
         record = ProgressRecord(
             document=payload.document,
@@ -236,6 +246,8 @@ def create_app(
     @app.post("/api/backfill")
     async def api_backfill():
         count = await synchronizer.backfill_calibre_books()
+        if synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
+            db.repair_missing_titles(synchronizer.calibre.get_book_by_id)
         return {"status": "completed", "backfilled_count": count}
 
     @app.get("/api/books")
@@ -292,6 +304,12 @@ def create_app(
             authors = d_dict.get("authors") or ""
             cal_id = d_dict.get("calibre_book_id")
             doc = str(d_dict.get("document", ""))
+            if (not title or title == "Unknown") and cal_id and synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
+                cal_b = synchronizer.calibre.get_book_by_id(cal_id)
+                if cal_b and cal_b.title:
+                    title = cal_b.title
+                    authors = authors or cal_b.authors
+                    db.update_document_metadata(doc, title, authors)
             pct = float(d_dict.get("percentage", 0.0))
             ts = d_dict.get("timestamp", 0)
             time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"

@@ -16,8 +16,10 @@ def test_extract_calibre_id():
 async def test_kavita_client_koreader_and_ondeck(monkeypatch):
     kavita = KavitaClient(base_url="http://kavita.test:5000", api_key="secret_token")
 
+    calls = []
     def mock_handler(request: httpx.Request):
         url_str = str(request.url).lower()
+        calls.append((request.method, url_str, request.content))
         if url_str.endswith("/users/auth"):
             return httpx.Response(200, json={"message": "Authorized"})
         elif url_str.endswith("/api/plugin/authenticate") or "/api/plugin/authenticate" in url_str:
@@ -40,8 +42,10 @@ async def test_kavita_client_koreader_and_ondeck(monkeypatch):
             })
         elif "/api/search/series-for-mangafile" in url_str:
             return httpx.Response(200, json={"id": 10, "name": "The Hobbit Series", "libraryId": 1})
+        elif "/api/reader/mark-chapter-read" in url_str:
+            return httpx.Response(200, json={"message": "Marked chapter read"})
         elif "/api/reader/mark-read" in url_str:
-            return httpx.Response(200, json={"message": "Marked read"})
+            raise AssertionError("mark-read on entire series should not be called!")
         elif "/api/reader/progress" in url_str:
             return httpx.Response(200, json={"message": "Progress saved"})
         elif "/api/series/on-deck" in url_str:
@@ -100,12 +104,24 @@ async def test_kavita_client_koreader_and_ondeck(monkeypatch):
     assert recent_reads[0].percentage == 0.5  # 150 / 300
     assert recent_reads[0].filename == "The Hobbit {42}.epub"
 
-    # 5. Test WebUI progress updates (100% -> mark-read, 50% -> progress)
+    # 5. Test WebUI progress updates (100% -> mark-chapter-read, 50% -> progress)
     webui_ok_100 = await kavita.update_webui_progress(calibre_id=42, percentage=1.0, title="The Hobbit")
     assert webui_ok_100 is True
 
+    import json
+    # Verify mark-chapter-read was called and NOT mark-read
+    chapter_read_calls = [c for c in calls if "mark-chapter-read" in c[1]]
+    assert len(chapter_read_calls) == 1
+    body = json.loads(chapter_read_calls[0][2].decode("utf-8"))
+    assert body["seriesId"] == 10
+    assert body["chapterId"] == 1001
+
+    series_read_calls = [c for c in calls if "mark-read" in c[1] and "mark-chapter-read" not in c[1]]
+    assert len(series_read_calls) == 0
+
     webui_ok_50 = await kavita.update_webui_progress(calibre_id=42, percentage=0.5, title="The Hobbit")
     assert webui_ok_50 is True
+
 
 
 @pytest.mark.asyncio

@@ -210,6 +210,10 @@ class Synchronizer:
                 )
                 if ok:
                     updated_count += 1
+                    ko_rec.title = book.title
+                    ko_rec.authors = book.authors
+                    ko_rec.calibre_id = book.book_id
+                    ko_rec.filename = f"{book.title} {{{book.book_id}}}.{book.format.lower() if book.format else 'epub'}"
                     self.db.upsert_progress(
                         record=ko_rec,
                         calibre_book_id=book.book_id,

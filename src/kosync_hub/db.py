@@ -1,10 +1,11 @@
-"""Internal SQLite storage for tracking synchronized books, hashes, and audit history."""
-
+import logging
 import os
 import sqlite3
 from pathlib import Path
 from typing import List, Optional
 from .models import ProgressRecord, SyncEvent
+
+logger = logging.getLogger("kosync_hub.db")
 
 
 class InternalDatabase:
@@ -411,6 +412,52 @@ class InternalDatabase:
     # Paginated Views & Reading History Statistics
     # -------------------------------------------------------------------------
 
+    def update_document_metadata(self, document: str, title: str, authors: Optional[str] = None):
+        """Updates title and authors for an existing tracked document."""
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE tracked_documents SET title = ?, authors = COALESCE(?, authors) WHERE document = ?",
+                (title, authors, document),
+            )
+            conn.commit()
+
+    def repair_missing_titles(self, calibre_get_book_by_id_fn) -> int:
+        """
+        Repairs any tracked_documents rows where title is NULL, empty, or 'Unknown'
+        by querying Calibre for the book's title and authors.
+        """
+        repaired = 0
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT document, calibre_book_id FROM tracked_documents
+                WHERE (title IS NULL OR title = '' OR title = 'Unknown')
+                  AND calibre_book_id IS NOT NULL
+                """
+            )
+            rows = cursor.fetchall()
+            for r in rows:
+                doc = r["document"]
+                bid = r["calibre_book_id"]
+                try:
+                    book = calibre_get_book_by_id_fn(bid)
+                    if book and book.title:
+                        conn.execute(
+                            """
+                            UPDATE tracked_documents
+                            SET title = ?, authors = COALESCE(?, authors)
+                            WHERE document = ?
+                            """,
+                            (book.title, book.authors, doc),
+                        )
+                        repaired += 1
+                except Exception as e:
+                    logger.debug(f"Failed to repair title for #{bid}: {e}")
+            conn.commit()
+        if repaired > 0:
+            logger.info(f"Successfully repaired {repaired} missing book titles from Calibre DB.")
+        return repaired
+
     def get_paginated_documents(
         self,
         page: int = 1,
@@ -425,8 +472,12 @@ class InternalDatabase:
                 term = f"%{search.strip().lower()}%"
                 count_cursor = conn.execute(
                     """
-                    SELECT COUNT(*) FROM tracked_documents
-                    WHERE lower(title) LIKE ? OR lower(authors) LIKE ? OR CAST(calibre_book_id AS TEXT) LIKE ? OR lower(document) LIKE ?
+                    SELECT COUNT(*) FROM tracked_documents d
+                    LEFT JOIN book_mappings m ON d.calibre_book_id = m.calibre_id
+                    WHERE lower(COALESCE(NULLIF(NULLIF(d.title, 'Unknown'), ''), m.title, '')) LIKE ?
+                       OR lower(COALESCE(NULLIF(d.authors, ''), m.authors, '')) LIKE ?
+                       OR CAST(d.calibre_book_id AS TEXT) LIKE ?
+                       OR lower(d.document) LIKE ?
                     """,
                     (term, term, term, term),
                 )
@@ -434,9 +485,27 @@ class InternalDatabase:
 
                 cursor = conn.execute(
                     """
-                    SELECT * FROM tracked_documents
-                    WHERE lower(title) LIKE ? OR lower(authors) LIKE ? OR CAST(calibre_book_id AS TEXT) LIKE ? OR lower(document) LIKE ?
-                    ORDER BY timestamp DESC
+                    SELECT 
+                        d.document,
+                        COALESCE(NULLIF(NULLIF(d.title, 'Unknown'), ''), m.title, m.kavita_series_name, 'Unknown') AS title,
+                        COALESCE(NULLIF(d.authors, ''), m.authors, '') AS authors,
+                        d.filename,
+                        d.calibre_book_id,
+                        d.progress,
+                        d.percentage,
+                        d.timestamp,
+                        d.device,
+                        d.device_id,
+                        d.kavita_synced_at,
+                        d.calibre_synced_at,
+                        d.last_sync_status
+                    FROM tracked_documents d
+                    LEFT JOIN book_mappings m ON d.calibre_book_id = m.calibre_id
+                    WHERE lower(COALESCE(NULLIF(NULLIF(d.title, 'Unknown'), ''), m.title, '')) LIKE ?
+                       OR lower(COALESCE(NULLIF(d.authors, ''), m.authors, '')) LIKE ?
+                       OR CAST(d.calibre_book_id AS TEXT) LIKE ?
+                       OR lower(d.document) LIKE ?
+                    ORDER BY d.timestamp DESC
                     LIMIT ? OFFSET ?
                     """,
                     (term, term, term, term, page_size, offset),
@@ -447,7 +516,26 @@ class InternalDatabase:
                 total = count_cursor.fetchone()[0]
 
                 cursor = conn.execute(
-                    "SELECT * FROM tracked_documents ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                    """
+                    SELECT 
+                        d.document,
+                        COALESCE(NULLIF(NULLIF(d.title, 'Unknown'), ''), m.title, m.kavita_series_name, 'Unknown') AS title,
+                        COALESCE(NULLIF(d.authors, ''), m.authors, '') AS authors,
+                        d.filename,
+                        d.calibre_book_id,
+                        d.progress,
+                        d.percentage,
+                        d.timestamp,
+                        d.device,
+                        d.device_id,
+                        d.kavita_synced_at,
+                        d.calibre_synced_at,
+                        d.last_sync_status
+                    FROM tracked_documents d
+                    LEFT JOIN book_mappings m ON d.calibre_book_id = m.calibre_id
+                    ORDER BY d.timestamp DESC
+                    LIMIT ? OFFSET ?
+                    """,
                     (page_size, offset),
                 )
                 rows = cursor.fetchall()

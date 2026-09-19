@@ -184,3 +184,41 @@ async def test_proxy_server_fanout():
             assert found_res.json()["total"] == 1
             assert found_res.json()["items"][0]["calibre_book_id"] == 9999
 
+            # 8. Test repair of missing titles (e.g. from user screenshot #56905)
+            # Insert a record with title=None
+            db.upsert_progress(
+                ProgressRecord(
+                    document="hash_56905",
+                    progress="100%",
+                    percentage=1.0,
+                    calibre_id=56905,
+                    title=None,
+                    authors=None,
+                    device="Kavita",
+                ),
+                calibre_book_id=56905,
+            )
+            # Before repair, verify get_paginated_documents can fallback or repair can populate
+            dummy_calibre.get_book_by_id = lambda bid: CalibreBookRecord(
+                book_id=56905,
+                title="Sleeping Little Sister",
+                authors="Author Name",
+                percentage=1.0,
+            ) if bid == 56905 else None
+            
+            repaired_count = db.repair_missing_titles(dummy_calibre.get_book_by_id)
+            assert repaired_count == 1
+
+            # Verify in /api/books and dashboard
+            res_repair = await client.get("/api/books?search=Sleeping")
+            assert res_repair.status_code == 200
+            assert res_repair.json()["total"] == 1
+            assert res_repair.json()["items"][0]["title"] == "Sleeping Little Sister"
+            assert res_repair.json()["items"][0]["authors"] == "Author Name"
+
+            res_dash = await client.get("/")
+            assert res_dash.status_code == 200
+            assert "Sleeping Little Sister" in res_dash.text
+            assert "#56905" in res_dash.text
+
+
