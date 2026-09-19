@@ -415,6 +415,39 @@ class CalibreDbClient(BaseSyncClient):
 
         return books
 
+    def get_all_books_with_progress(self) -> List[CalibreBookRecord]:
+        """Fetches ALL books from Calibre that have reading progress (> 0% or marked read)."""
+        books = []
+        seen_ids = set()
+        with self._get_connection() as conn:
+            self._refresh_column_cache(conn)
+
+            # 1. Books with read percentage > 0
+            if self.read_pct_label in self._column_cache:
+                col_id, _ = self._column_cache[self.read_pct_label]
+                cursor = conn.execute(f"SELECT book FROM custom_column_{col_id} WHERE value > 0")
+                for r in cursor.fetchall():
+                    bid = r["book"]
+                    if bid not in seen_ids:
+                        seen_ids.add(bid)
+                        b = self.get_book_by_id(bid)
+                        if b:
+                            books.append(b)
+
+            # 2. Books with read status = 1 (true)
+            if self.read_status_label in self._column_cache:
+                col_id, _ = self._column_cache[self.read_status_label]
+                cursor = conn.execute(f"SELECT book FROM custom_column_{col_id} WHERE value = 1")
+                for r in cursor.fetchall():
+                    bid = r["book"]
+                    if bid not in seen_ids:
+                        seen_ids.add(bid)
+                        b = self.get_book_by_id(bid)
+                        if b:
+                            books.append(b)
+
+        return books
+
     def update_book_progress(
         self,
         book_id: int,

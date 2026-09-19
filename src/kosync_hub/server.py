@@ -233,6 +233,11 @@ def create_app(
         res = await synchronizer.sync_all()
         return {"status": "completed", "result": res}
 
+    @app.post("/api/backfill")
+    async def api_backfill():
+        count = await synchronizer.backfill_calibre_books()
+        return {"status": "completed", "backfilled_count": count}
+
     @app.get("/api/books")
     async def api_books(
         page: int = 1,
@@ -266,10 +271,12 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(
+        request: Request,
         page: int = 1,
         event_page: int = 1,
         search: Optional[str] = None,
     ):
+        base_url = str(request.base_url).rstrip("/")
         stats = db.get_reading_stats()
         page_size = 12
         tracked_docs, total_docs = db.get_paginated_documents(page=page, page_size=page_size, search=search)
@@ -382,6 +389,28 @@ def create_app(
         <h1>📖 Kavita & Calibre Sync Hub</h1>
         <p style="color: #94a3b8; margin-bottom: 1.5rem;">CrossPoint / KOReader single-user sync with Calibre DB & Kavita WebUI integration.</p>
         
+        <!-- KOReader / CrossPoint Connection Card -->
+        <div class="card" style="border-left: 4px solid #38bdf8; background: #1e293b;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem;">
+                <div>
+                    <h3 style="margin: 0 0 0.25rem 0; color: #38bdf8; font-size: 1.1rem;">📱 KOReader & CrossPoint Device Sync URL</h3>
+                    <p style="margin: 0; color: #94a3b8; font-size: 0.85rem;">
+                        Enter this server URL in your KOReader / CrossPoint Sync settings. Any username/password is accepted.
+                    </p>
+                </div>
+                <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                    <div style="background: #0f172a; padding: 0.4rem 0.8rem; border-radius: 6px; border: 1px solid #334155; display: flex; align-items: center; gap: 0.5rem;">
+                        <span style="color: #94a3b8; font-size: 0.8rem; text-transform: uppercase; font-weight: 600;">Server URL:</span>
+                        <code id="sync-url" style="color: #38bdf8; font-weight: bold; font-size: 0.95rem;">{base_url}</code>
+                    </div>
+                    <button class="btn btn-secondary" onclick="navigator.clipboard.writeText(document.getElementById('sync-url').innerText); this.innerText='Copied!'; setTimeout(() => this.innerText='📋 Copy', 2000);">📋 Copy</button>
+                </div>
+            </div>
+            <div style="margin-top: 0.75rem; font-size: 0.8rem; color: #64748b; border-top: 1px solid #334155; padding-top: 0.5rem;">
+                Tip for Xteink X3 / CrossPoint: Export books from Calibre formatted with <code style="color:#cbd5e1;">&#123;id&#125;</code> (e.g. <code style="color:#cbd5e1;">Title - Author &#123;123&#125;.epub</code>) to sync automatically even when compressed or renamed.
+            </div>
+        </div>
+
         <!-- Reading History Statistics -->
         <div class="grid">
             <div class="stat-card">
@@ -417,12 +446,15 @@ def create_app(
                     <h2 style="margin: 0; font-size: 1.25rem;">Books & Reading Progress</h2>
                     <span style="font-size: 0.85rem; color: #94a3b8;">{total_docs} total books in database</span>
                 </div>
-                <div style="display: flex; gap: 0.5rem; align-items: center;">
+                <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
                     <form method="GET" action="/" style="display: flex; gap: 0.5rem;">
                         <input type="hidden" name="event_page" value="{event_page}">
                         <input type="text" name="search" class="search-input" placeholder="Search title, author, #id..." value="{search_val}">
                         <button class="btn btn-secondary" type="submit">Search</button>
                         {f'<a href="/?event_page={event_page}" class="btn btn-secondary">Clear</a>' if search else ''}
+                    </form>
+                    <form action="/api/backfill" method="POST" onsubmit="event.preventDefault(); const b=this.querySelector('button'); b.disabled=true; b.innerText='Backfilling...'; fetch('/api/backfill', {{method: 'POST'}}).then(r=>r.json()).then(d=>{{ alert('Backfilled ' + d.backfilled_count + ' books from Calibre!'); location.reload(); }}).catch(e=>{{ alert('Error: ' + e); b.disabled=false; b.innerText='📥 Backfill from Calibre'; }});">
+                        <button class="btn btn-secondary" type="submit" title="Scan Calibre DB for all books with read percentage or status and import them into KOReader Hub">📥 Backfill from Calibre</button>
                     </form>
                     <form action="/api/sync-now" method="POST" onsubmit="event.preventDefault(); fetch('/api/sync-now', {{method: 'POST'}}).then(() => location.reload());">
                         <button class="btn" type="submit">🔄 Sync Now</button>

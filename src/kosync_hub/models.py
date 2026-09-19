@@ -67,7 +67,7 @@ class CalibreBookRecord(BaseModel):
     book_id: int
     title: str
     authors: str
-    path: str
+    path: str = ""
     file_path: Optional[str] = None
     format: Optional[str] = None
     percentage: float = 0.0

@@ -110,6 +110,9 @@ async def test_proxy_server_fanout():
             assert "Project Hail Mary" in res.text
             assert "#123" in res.text
             assert "Tracked Books" in res.text
+            assert "KOReader &amp; CrossPoint Device Sync URL" in res.text or "KOReader & CrossPoint Device Sync URL" in res.text
+            assert "Server URL:" in res.text
+            assert "Backfill from Calibre" in res.text
 
             # 6. Test CrossPoint / Xteink X3 compressed ebook scenario
             # Device sends a compressed hash different from original, but includes {calibre_id} in filename
@@ -157,4 +160,27 @@ async def test_proxy_server_fanout():
             assert books_res.status_code == 200
             assert books_res.json()["total"] == 1
             assert books_res.json()["items"][0]["calibre_book_id"] == 49522
+
+            # 7. Test backfill endpoint
+            from kosync_hub.clients.calibre_db import CalibreBookRecord
+            dummy_calibre.get_all_books_with_progress = lambda: [
+                CalibreBookRecord(
+                    book_id=9999,
+                    title="Foundation",
+                    authors="Isaac Asimov",
+                    percentage=0.67,
+                    is_read=False,
+                    koreader_progress="page:67%",
+                )
+            ]
+            backfill_res = await client.post("/api/backfill")
+            assert backfill_res.status_code == 200
+            assert backfill_res.json()["status"] == "completed"
+            assert backfill_res.json()["backfilled_count"] == 1
+
+            # Check that Foundation is now in tracked books
+            found_res = await client.get("/api/books?search=Foundation")
+            assert found_res.status_code == 200
+            assert found_res.json()["total"] == 1
+            assert found_res.json()["items"][0]["calibre_book_id"] == 9999
 

@@ -309,6 +309,83 @@ class Synchronizer:
 
         return updated_count
 
+    async def backfill_calibre_books(self) -> int:
+        """
+        Backfills all books with reading progress from Calibre into the internal database
+        and syncs them to Kavita (WebUI & KOReader endpoint).
+        """
+        if not self.calibre:
+            return 0
+
+        books = []
+        if hasattr(self.calibre, "get_all_books_with_progress"):
+            books = self.calibre.get_all_books_with_progress()
+        elif hasattr(self.calibre, "get_recently_read_books"):
+            books = self.calibre.get_recently_read_books(limit=10000)
+
+        logger.info(f"Starting backfill: found {len(books)} books with progress in Calibre...")
+        count = 0
+        now_ts = int(datetime.utcnow().timestamp())
+
+        for b in books:
+            if b.percentage <= 0 and not b.is_read:
+                continue
+
+            pct = 1.0 if b.is_read and b.percentage < 0.98 else b.percentage
+            hsh = b.koreader_hash or f"calibre_{b.book_id}"
+            prog_str = b.koreader_progress or (f"page:{round(pct * 100, 1)}%" if pct > 0 else "0")
+
+            rec = ProgressRecord(
+                document=hsh,
+                progress=prog_str,
+                percentage=pct,
+                timestamp=now_ts,
+                device="Calibre",
+                title=b.title,
+                authors=b.authors,
+                filename=f"{b.title} {{{b.book_id}}}.{b.format.lower() if b.format else 'epub'}",
+                calibre_id=b.book_id,
+            )
+
+            # Insert/update in local database
+            self.db.upsert_progress(
+                record=rec,
+                calibre_book_id=b.book_id,
+                calibre_synced_at=now_ts,
+                sync_status="synced",
+            )
+            self.db.update_sync_state(
+                calibre_id=b.book_id,
+                percentage=pct,
+                progress=prog_str,
+                source="calibre_backfill",
+                synced_at=now_ts,
+            )
+
+            # Optionally push to Kavita if configured
+            if self.kavita:
+                try:
+                    await self.kavita.update_progress(rec)
+                except Exception as e:
+                    logger.debug(f"Kavita update during backfill for #{b.book_id}: {e}")
+
+            count += 1
+
+        self.db.log_sync_event(
+            SyncEvent(
+                document="backfill",
+                source="calibre_db",
+                target="hub_db",
+                progress="100%",
+                percentage=1.0,
+                timestamp=now_ts,
+                success=True,
+                message=f"Backfilled {count} books from Calibre DB to Books & Reading progress",
+            )
+        )
+        logger.info(f"Backfill complete: imported {count} books into Books & Reading progress overview.")
+        return count
+
     async def sync_all(self) -> Dict[str, Any]:
         """Runs a complete bidirectional sync pass between Kavita and Calibre."""
         logger.info("Starting bidirectional sync pass between Kavita and Calibre DB...")
