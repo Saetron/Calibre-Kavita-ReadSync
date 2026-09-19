@@ -19,6 +19,7 @@ class ProgressPayload(BaseModel):
     device: Optional[str] = "KOReader"
     device_id: Optional[str] = None
     metadata: Optional[DocumentMetadata] = None
+    position: Optional[Dict[str, Any]] = None  # CrossPoint rich position extension
 
 
 class ProgressRecord(BaseModel):

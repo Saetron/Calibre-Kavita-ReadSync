@@ -144,3 +144,24 @@ async def test_kavita_opds_fallback(monkeypatch):
     assert reads[0].calibre_id == 77
     assert "Neuromancer" in reads[0].series_name
 
+
+@pytest.mark.asyncio
+async def test_kavita_db_mapping_cache(tmp_path):
+    from kosync_hub.db import InternalDatabase
+    db = InternalDatabase(str(tmp_path / "cache_test.db"))
+
+    # Pre-populate DB cache
+    db.save_mapping(
+        calibre_id=999,
+        kavita_series_id=888,
+        kavita_series_name="Cached Series",
+        pages=450,
+    )
+
+    kavita = KavitaClient(base_url="http://kavita.test:5000", api_key="secret_token", db=db)
+    meta = await kavita.find_kavita_metadata_by_calibre_id(999)
+    assert meta is not None
+    assert meta["series_id"] == 888
+    assert meta["series_name"] == "Cached Series"
+    assert meta["pages"] == 450
+

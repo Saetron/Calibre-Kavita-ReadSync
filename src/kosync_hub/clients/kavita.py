@@ -27,13 +27,14 @@ def extract_calibre_id(filename: Optional[str]) -> Optional[int]:
 class KavitaClient(BaseSyncClient):
     """Client for interacting with Kavita's KOReader endpoint and REST API."""
 
-    def __init__(self, base_url: str, api_key: str, timeout: float = 15.0):
+    def __init__(self, base_url: str, api_key: str, timeout: float = 15.0, db: Optional[Any] = None):
         self.raw_base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.koreader_url = f"{self.raw_base_url}/api/koreader/{self.api_key}"
         self.timeout = timeout
         self.jwt_token: Optional[str] = None
         self._calibre_id_to_kavita: Dict[int, Dict[str, Any]] = {}
+        self.db = db
 
     @property
     def name(self) -> str:
@@ -171,6 +172,21 @@ class KavitaClient(BaseSyncClient):
         if calibre_id in self._calibre_id_to_kavita:
             return self._calibre_id_to_kavita[calibre_id]
 
+        # Check internal database mapping cache
+        if self.db and hasattr(self.db, "get_mapping_by_calibre_id"):
+            cached = self.db.get_mapping_by_calibre_id(calibre_id)
+            if cached and cached.get("kavita_series_id"):
+                res_meta = {
+                    "series_id": cached.get("kavita_series_id"),
+                    "series_name": cached.get("kavita_series_name"),
+                    "library_id": cached.get("kavita_library_id"),
+                    "chapter_id": cached.get("kavita_chapter_id"),
+                    "volume_id": cached.get("kavita_volume_id"),
+                    "pages": cached.get("pages"),
+                }
+                self._calibre_id_to_kavita[calibre_id] = res_meta
+                return res_meta
+
         headers = self._get_rest_headers()
         queries = [f"{{{calibre_id}}}", str(calibre_id)]
         if title:
@@ -207,6 +223,16 @@ class KavitaClient(BaseSyncClient):
                                     "pages": f.get("pages"),
                                 }
                                 self._calibre_id_to_kavita[calibre_id] = res_meta
+                                if self.db and hasattr(self.db, "save_mapping"):
+                                    self.db.save_mapping(
+                                        calibre_id=calibre_id,
+                                        kavita_series_id=sid,
+                                        kavita_series_name=sname,
+                                        kavita_library_id=lid,
+                                        pages=f.get("pages"),
+                                        title=title,
+                                        filename=fp,
+                                    )
                                 return res_meta
 
                     # 2. Check chapters
@@ -222,6 +248,16 @@ class KavitaClient(BaseSyncClient):
                                 "pages": ch.get("pages"),
                             }
                             self._calibre_id_to_kavita[calibre_id] = res_meta
+                            if self.db and hasattr(self.db, "save_mapping"):
+                                self.db.save_mapping(
+                                    calibre_id=calibre_id,
+                                    kavita_series_id=ch.get("seriesId"),
+                                    kavita_series_name=ch_title,
+                                    kavita_volume_id=ch.get("volumeId"),
+                                    kavita_chapter_id=ch.get("id"),
+                                    pages=ch.get("pages"),
+                                    title=title,
+                                )
                             return res_meta
 
                     # 3. Check series
@@ -238,6 +274,14 @@ class KavitaClient(BaseSyncClient):
                                 "pages": None,
                             }
                             self._calibre_id_to_kavita[calibre_id] = res_meta
+                            if self.db and hasattr(self.db, "save_mapping"):
+                                self.db.save_mapping(
+                                    calibre_id=calibre_id,
+                                    kavita_series_id=sid,
+                                    kavita_series_name=s_name,
+                                    kavita_library_id=s.get("libraryId"),
+                                    title=title,
+                                )
                             return res_meta
 
         except Exception as e:

@@ -41,6 +41,7 @@ def init_components(config: AppConfig):
             base_url=config.kavita.base_url,
             api_key=config.kavita.api_key,
             timeout=config.kavita.timeout,
+            db=db,
         )
 
     calibre = None

@@ -128,18 +128,34 @@ When `auto_create_columns: true` is enabled, `kosync-hub` automatically creates 
 
 ---
 
-## KOReader Configuration
+---
 
-In KOReader:
-1. Open top menu ➔ **Settings** (or **Tools**) ➔ **Progress Sync** (or **Plugins** ➔ **Progress Sync**).
-2. Set **Custom sync server** to your Kavita KOReader endpoint:
-   ```
-   http://<YOUR_KAVITA_IP>:5000/api/koreader/<YOUR_API_KEY>
-   ```
-3. Set **Document matching method** to **Binary**.
-4. Enable **Auto sync**.
+## CrossPoint (Xteink X3 / X4) Configuration
 
-You continue reading as normal. Whenever KOReader syncs with Kavita, `kosync-hub` checks recent reads and updates Calibre's database!
+For devices running **CrossPoint** (e.g. Xteink X3 / X4) with compressed ebooks:
+
+Because compressed or reformatted ebooks have different file hashes than the original files in Calibre/Kavita, `kosync-hub` provides a built-in single-user KOReader endpoint that matches books using their **filename Calibre ID** (`{id}`).
+
+1. On your Xteink device, open **Settings ➔ System ➔ KOReader Sync**.
+2. Set the **Sync Server URL** to:
+   ```
+   http://<YOUR_KOSYNC_HUB_IP>:8080
+   ```
+   *(or `http://<YOUR_KOSYNC_HUB_IP>:8080/koreader`)*
+3. Enter any username and password (single-user open auth accepts any credentials).
+4. Tap **Authenticate**.
+5. When naming your compressed ebook files on the Xteink X3, retain the Calibre ID in curly brackets (e.g. `Dune {49522}.epub`).
+6. When you upload or pull progress, `kosync-hub` automatically bridges your compressed file hash to Calibre (`metadata.db`) and Kavita's WebUI!
+
+---
+
+## WebUI Dashboard
+
+Visit `http://<server-ip>:8080` to access the responsive web dashboard:
+* **Reading History & Statistics**: Cards for total books, completed reads ($\ge 98\%$), in-progress reads, sync activity today & 7 days, and connected devices.
+* **Paginated Books View**: Searchable list of all tracked books with reading progress bars, Calibre IDs, device badges, and status.
+* **Sync Audit Log**: Paginated event logs showing real-time progress fanout and synchronization results.
+* **Sync Now Button**: Manually trigger an immediate sync pass at any time.
 
 ---
 

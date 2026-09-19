@@ -39,12 +39,34 @@ class Synchronizer:
         local_rec = self.db.get_document(document)
         records = [r for r in [local_rec] if r]
 
+        calibre_id = None
+        if local_rec and local_rec.calibre_id:
+            calibre_id = local_rec.calibre_id
+        else:
+            calibre_id = self.db.get_calibre_id_for_document(document)
+
+        canonical_hash = document
+        if calibre_id:
+            # Check if there is a canonical document hash or Calibre record
+            if self.calibre and hasattr(self.calibre, "get_book_by_id"):
+                cal_book = self.calibre.get_book_by_id(calibre_id)
+                if cal_book:
+                    if getattr(cal_book, "koreader_hash", None):
+                        canonical_hash = cal_book.koreader_hash
+                    # Get progress from Calibre
+                    c_rec = await self.calibre.get_progress(canonical_hash)
+                    if c_rec:
+                        records.append(c_rec)
+
         if self.kavita:
-            k_rec = await self.kavita.get_progress(document)
+            # Check Kavita with both the requested hash and canonical hash
+            k_rec = await self.kavita.get_progress(canonical_hash)
+            if not k_rec and canonical_hash != document:
+                k_rec = await self.kavita.get_progress(document)
             if k_rec:
                 records.append(k_rec)
 
-        if self.calibre:
+        if self.calibre and canonical_hash == document:
             c_rec = await self.calibre.get_progress(document)
             if c_rec:
                 records.append(c_rec)
@@ -53,11 +75,34 @@ class Synchronizer:
             return {"document": document, "synced": False}
 
         winner = max(records, key=lambda r: (r.timestamp, r.percentage))
-        if local_rec and not winner.calibre_id:
-            winner.calibre_id = local_rec.calibre_id
+        if calibre_id and not winner.calibre_id:
+            winner.calibre_id = calibre_id
 
-        self.db.upsert_progress(winner)
-        return {"document": document, "synced": True, "winner": winner}
+        # Save under requested document hash so device lookup succeeds
+        device_rec = ProgressRecord(
+            document=document,
+            progress=winner.progress,
+            percentage=winner.percentage,
+            timestamp=winner.timestamp,
+            device=winner.device,
+            device_id=winner.device_id,
+            title=winner.title,
+            authors=winner.authors,
+            filename=winner.filename,
+            calibre_id=calibre_id or winner.calibre_id,
+        )
+        self.db.upsert_progress(device_rec, calibre_book_id=calibre_id or winner.calibre_id)
+
+        if calibre_id:
+            self.db.update_sync_state(
+                calibre_id=calibre_id,
+                percentage=winner.percentage,
+                progress=winner.progress,
+                source="sync_document",
+                synced_at=winner.timestamp,
+            )
+
+        return {"document": document, "synced": True, "winner": device_rec}
 
     async def sync_kavita_to_calibre(self) -> int:
         """

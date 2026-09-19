@@ -109,4 +109,52 @@ async def test_proxy_server_fanout():
             assert res.status_code == 200
             assert "Project Hail Mary" in res.text
             assert "#123" in res.text
+            assert "Tracked Books" in res.text
+
+            # 6. Test CrossPoint / Xteink X3 compressed ebook scenario
+            # Device sends a compressed hash different from original, but includes {calibre_id} in filename
+            # and sends CrossPoint position object.
+            crosspoint_payload = {
+                "document": "xteink_compressed_hash_49522",
+                "progress": "epubcfi(/6/4[chapter-2]!/4/2/1:0)",
+                "percentage": 0.82,
+                "device": "CrossPoint",
+                "device_id": "crosspoint-x3",
+                "metadata": {
+                    "title": "Dune",
+                    "authors": "Frank Herbert",
+                    "filename": "Dune {49522}.epub",
+                },
+                "position": {
+                    "pctQ": 8200,
+                    "spine": 2,
+                    "page": 150,
+                    "pages": 600,
+                    "para": 12,
+                },
+            }
+            res = await client.put("/syncs/progress", json=crosspoint_payload)
+            assert res.status_code == 200
+
+            # Verify Calibre ID was extracted and linked as an alias
+            assert db.get_calibre_id_for_document("xteink_compressed_hash_49522") == 49522
+
+            # Pull progress using the compressed document hash
+            res = await client.get("/syncs/progress/xteink_compressed_hash_49522")
+            assert res.status_code == 200
+            assert res.json()["percentage"] == 0.82
+
+            # Verify stats API
+            stats_res = await client.get("/api/stats")
+            assert stats_res.status_code == 200
+            stats_data = stats_res.json()
+            assert stats_data["total_tracked"] >= 2
+            assert stats_data["in_progress"] >= 1
+            assert stats_data["aliases_count"] >= 1
+
+            # Test search pagination
+            books_res = await client.get("/api/books?search=Dune")
+            assert books_res.status_code == 200
+            assert books_res.json()["total"] == 1
+            assert books_res.json()["items"][0]["calibre_book_id"] == 49522
 

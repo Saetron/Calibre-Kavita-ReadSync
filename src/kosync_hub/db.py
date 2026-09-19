@@ -53,6 +53,42 @@ class InternalDatabase:
                     message TEXT
                 )
             """)
+            # Book metadata mapping cache (Calibre ID <-> Kavita IDs)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS book_mappings (
+                    calibre_id INTEGER PRIMARY KEY,
+                    kavita_series_id INTEGER,
+                    kavita_series_name TEXT,
+                    kavita_volume_id INTEGER,
+                    kavita_chapter_id INTEGER,
+                    kavita_library_id INTEGER,
+                    pages INTEGER,
+                    koreader_hash TEXT,
+                    title TEXT,
+                    authors TEXT,
+                    filename TEXT,
+                    updated_at INTEGER NOT NULL
+                )
+            """)
+            # Alternative document hashes (e.g. compressed files on Xteink X3)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS document_aliases (
+                    document TEXT PRIMARY KEY,
+                    calibre_id INTEGER NOT NULL,
+                    device TEXT,
+                    created_at INTEGER NOT NULL
+                )
+            """)
+            # Sync state tracking for conflict resolution
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sync_state (
+                    calibre_id INTEGER PRIMARY KEY,
+                    last_percentage REAL NOT NULL,
+                    last_progress TEXT NOT NULL,
+                    last_source TEXT,
+                    last_synced_at INTEGER NOT NULL
+                )
+            """)
             try:
                 conn.execute("ALTER TABLE sync_events ADD COLUMN calibre_id INTEGER")
             except sqlite3.OperationalError:
@@ -60,6 +96,7 @@ class InternalDatabase:
 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tracked_timestamp ON tracked_documents(timestamp)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_timestamp ON sync_events(timestamp DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_aliases_calibre ON document_aliases(calibre_id)")
             conn.commit()
 
     def upsert_progress(
@@ -184,3 +221,299 @@ class InternalDatabase:
         with self._get_connection() as conn:
             cursor = conn.execute("SELECT COUNT(*) FROM tracked_documents")
             return cursor.fetchone()[0]
+
+    # -------------------------------------------------------------------------
+    # Book Metadata Mappings (Calibre ID <-> Kavita IDs)
+    # -------------------------------------------------------------------------
+
+    def get_mapping_by_calibre_id(self, calibre_id: int) -> Optional[dict]:
+        """Gets cached Kavita metadata for a Calibre book ID."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM book_mappings WHERE calibre_id = ?",
+                (calibre_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return dict(row)
+
+    def save_mapping(
+        self,
+        calibre_id: int,
+        kavita_series_id: Optional[int] = None,
+        kavita_series_name: Optional[str] = None,
+        kavita_volume_id: Optional[int] = None,
+        kavita_chapter_id: Optional[int] = None,
+        kavita_library_id: Optional[int] = None,
+        pages: Optional[int] = None,
+        koreader_hash: Optional[str] = None,
+        title: Optional[str] = None,
+        authors: Optional[str] = None,
+        filename: Optional[str] = None,
+    ):
+        """Caches resolved Kavita metadata mapping for a Calibre ID."""
+        import time
+        now = int(time.time())
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO book_mappings (
+                    calibre_id, kavita_series_id, kavita_series_name, kavita_volume_id,
+                    kavita_chapter_id, kavita_library_id, pages, koreader_hash,
+                    title, authors, filename, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(calibre_id) DO UPDATE SET
+                    kavita_series_id = COALESCE(excluded.kavita_series_id, book_mappings.kavita_series_id),
+                    kavita_series_name = COALESCE(excluded.kavita_series_name, book_mappings.kavita_series_name),
+                    kavita_volume_id = COALESCE(excluded.kavita_volume_id, book_mappings.kavita_volume_id),
+                    kavita_chapter_id = COALESCE(excluded.kavita_chapter_id, book_mappings.kavita_chapter_id),
+                    kavita_library_id = COALESCE(excluded.kavita_library_id, book_mappings.kavita_library_id),
+                    pages = COALESCE(excluded.pages, book_mappings.pages),
+                    koreader_hash = COALESCE(excluded.koreader_hash, book_mappings.koreader_hash),
+                    title = COALESCE(excluded.title, book_mappings.title),
+                    authors = COALESCE(excluded.authors, book_mappings.authors),
+                    filename = COALESCE(excluded.filename, book_mappings.filename),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    calibre_id,
+                    kavita_series_id,
+                    kavita_series_name,
+                    kavita_volume_id,
+                    kavita_chapter_id,
+                    kavita_library_id,
+                    pages,
+                    koreader_hash,
+                    title,
+                    authors,
+                    filename,
+                    now,
+                ),
+            )
+            conn.commit()
+
+    # -------------------------------------------------------------------------
+    # Document Hash Aliases (e.g. CrossPoint compressed files)
+    # -------------------------------------------------------------------------
+
+    def link_document_alias(self, document: str, calibre_id: int, device: Optional[str] = None):
+        """Associates an arbitrary document hash (e.g. from compressed e-reader files) with a Calibre ID."""
+        import time
+        now = int(time.time())
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO document_aliases (document, calibre_id, device, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(document) DO UPDATE SET
+                    calibre_id = excluded.calibre_id,
+                    device = COALESCE(excluded.device, document_aliases.device)
+                """,
+                (document, calibre_id, device, now),
+            )
+            conn.commit()
+
+    def get_calibre_id_for_document(self, document: str) -> Optional[int]:
+        """Resolves a document hash to its Calibre ID via document_aliases or tracked_documents."""
+        with self._get_connection() as conn:
+            # Check document_aliases first
+            cursor = conn.execute(
+                "SELECT calibre_id FROM document_aliases WHERE document = ?",
+                (document,),
+            )
+            row = cursor.fetchone()
+            if row and row["calibre_id"]:
+                return row["calibre_id"]
+
+            # Fallback to tracked_documents
+            cursor = conn.execute(
+                "SELECT calibre_book_id FROM tracked_documents WHERE document = ?",
+                (document,),
+            )
+            row = cursor.fetchone()
+            if row and row["calibre_book_id"]:
+                return row["calibre_book_id"]
+
+        return None
+
+    def get_document_by_calibre_id(self, calibre_id: int) -> Optional[str]:
+        """Returns the primary or recent document hash associated with a Calibre ID."""
+        with self._get_connection() as conn:
+            # Check tracked documents
+            cursor = conn.execute(
+                "SELECT document FROM tracked_documents WHERE calibre_book_id = ? ORDER BY timestamp DESC LIMIT 1",
+                (calibre_id,),
+            )
+            row = cursor.fetchone()
+            if row and row["document"]:
+                return row["document"]
+
+            # Check book mappings
+            cursor = conn.execute(
+                "SELECT koreader_hash FROM book_mappings WHERE calibre_id = ?",
+                (calibre_id,),
+            )
+            row = cursor.fetchone()
+            if row and row["koreader_hash"]:
+                return row["koreader_hash"]
+
+            # Check aliases
+            cursor = conn.execute(
+                "SELECT document FROM document_aliases WHERE calibre_id = ? ORDER BY created_at DESC LIMIT 1",
+                (calibre_id,),
+            )
+            row = cursor.fetchone()
+            if row and row["document"]:
+                return row["document"]
+
+        return None
+
+    # -------------------------------------------------------------------------
+    # Sync State Tracking (for conflict resolution)
+    # -------------------------------------------------------------------------
+
+    def get_sync_state(self, calibre_id: int) -> Optional[dict]:
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM sync_state WHERE calibre_id = ?",
+                (calibre_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def update_sync_state(
+        self,
+        calibre_id: int,
+        percentage: float,
+        progress: str,
+        source: str,
+        synced_at: Optional[int] = None,
+    ):
+        import time
+        now = synced_at or int(time.time())
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO sync_state (calibre_id, last_percentage, last_progress, last_source, last_synced_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(calibre_id) DO UPDATE SET
+                    last_percentage = excluded.last_percentage,
+                    last_progress = excluded.last_progress,
+                    last_source = excluded.last_source,
+                    last_synced_at = excluded.last_synced_at
+                """,
+                (calibre_id, percentage, progress, source, now),
+            )
+            conn.commit()
+
+    # -------------------------------------------------------------------------
+    # Paginated Views & Reading History Statistics
+    # -------------------------------------------------------------------------
+
+    def get_paginated_documents(
+        self,
+        page: int = 1,
+        page_size: int = 15,
+        search: Optional[str] = None,
+    ) -> tuple[List[sqlite3.Row], int]:
+        """Returns paginated tracked documents and the total matching count."""
+        page = max(1, page)
+        offset = (page - 1) * page_size
+        with self._get_connection() as conn:
+            if search and search.strip():
+                term = f"%{search.strip().lower()}%"
+                count_cursor = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM tracked_documents
+                    WHERE lower(title) LIKE ? OR lower(authors) LIKE ? OR CAST(calibre_book_id AS TEXT) LIKE ? OR lower(document) LIKE ?
+                    """,
+                    (term, term, term, term),
+                )
+                total = count_cursor.fetchone()[0]
+
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM tracked_documents
+                    WHERE lower(title) LIKE ? OR lower(authors) LIKE ? OR CAST(calibre_book_id AS TEXT) LIKE ? OR lower(document) LIKE ?
+                    ORDER BY timestamp DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (term, term, term, term, page_size, offset),
+                )
+                rows = cursor.fetchall()
+            else:
+                count_cursor = conn.execute("SELECT COUNT(*) FROM tracked_documents")
+                total = count_cursor.fetchone()[0]
+
+                cursor = conn.execute(
+                    "SELECT * FROM tracked_documents ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                    (page_size, offset),
+                )
+                rows = cursor.fetchall()
+
+            return rows, total
+
+    def get_paginated_events(
+        self,
+        page: int = 1,
+        page_size: int = 15,
+    ) -> tuple[List[sqlite3.Row], int]:
+        """Returns paginated sync events and total count."""
+        page = max(1, page)
+        offset = (page - 1) * page_size
+        with self._get_connection() as conn:
+            count_cursor = conn.execute("SELECT COUNT(*) FROM sync_events")
+            total = count_cursor.fetchone()[0]
+
+            cursor = conn.execute(
+                "SELECT * FROM sync_events ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                (page_size, offset),
+            )
+            rows = cursor.fetchall()
+            return rows, total
+
+    def get_reading_stats(self) -> dict:
+        """Calculates reading history and synchronization statistics."""
+        import time
+        now = int(time.time())
+        one_day_ago = now - (24 * 3600)
+        one_week_ago = now - (7 * 24 * 3600)
+
+        with self._get_connection() as conn:
+            # Total tracked
+            tracked_count = conn.execute("SELECT COUNT(*) FROM tracked_documents").fetchone()[0]
+
+            # Completed books (>= 98%)
+            completed_count = conn.execute(
+                "SELECT COUNT(DISTINCT coalesce(calibre_book_id, document)) FROM tracked_documents WHERE percentage >= 0.98"
+            ).fetchone()[0]
+
+            # In progress books (> 0% and < 98%)
+            in_progress_count = conn.execute(
+                "SELECT COUNT(DISTINCT coalesce(calibre_book_id, document)) FROM tracked_documents WHERE percentage > 0.0 AND percentage < 0.98"
+            ).fetchone()[0]
+
+            # Sync events today
+            syncs_today = conn.execute(
+                "SELECT COUNT(*) FROM sync_events WHERE timestamp >= ?",
+                (one_day_ago,),
+            ).fetchone()[0]
+
+            # Sync events this week
+            syncs_week = conn.execute(
+                "SELECT COUNT(*) FROM sync_events WHERE timestamp >= ?",
+                (one_week_ago,),
+            ).fetchone()[0]
+
+            # Aliased devices count
+            alias_count = conn.execute("SELECT COUNT(*) FROM document_aliases").fetchone()[0]
+
+            return {
+                "total_tracked": tracked_count,
+                "completed_books": completed_count,
+                "in_progress": in_progress_count,
+                "syncs_today": syncs_today,
+                "syncs_week": syncs_week,
+                "aliases_count": alias_count,
+            }
