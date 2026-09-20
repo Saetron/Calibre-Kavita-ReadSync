@@ -60,6 +60,8 @@ def create_app(
             asyncio.create_task(synchronizer.kavita.test_connection())
         if synchronizer.calibre:
             asyncio.create_task(synchronizer.calibre.test_connection())
+            if hasattr(synchronizer.calibre, "load_filename_hashes_async"):
+                asyncio.create_task(synchronizer.calibre.load_filename_hashes_async())
 
         # Scan Calibre library if enabled
         if config.sync.scan_on_startup and hasattr(synchronizer.calibre, "scan_and_index_library"):
