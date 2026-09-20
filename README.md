@@ -137,9 +137,10 @@ services:
       # Configuration file (rw allows saving settings from the WebUI)
       - ./config.yaml:/app/config/config.yaml:rw
     environment:
-      - CALIBRE_LIBRARY_PATH=/calibre/library
-      - VFS_DIR=/vfs
-      - VFS_MODE=hardlink
+      # Optional environment variable overrides (all settings can also be configured via WebUI)
+      - KAVITA_URL=http://kavita:5000
+      - KAVITA_API_KEY=YOUR_KAVITA_API_KEY
+      - SYNC_INTERVAL_SECONDS=300
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/healthcheck"]
       interval: 30s

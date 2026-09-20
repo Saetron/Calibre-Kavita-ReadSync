@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 import yaml
 from pydantic import BaseModel, Field
 
@@ -128,69 +128,105 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
     config = AppConfig(**config_dict)
 
     # Apply environment variable overrides
+    def _should_apply(section: Optional[str], key: str, env_val: Optional[str], default_val: Any = None) -> bool:
+        if env_val is None:
+            return False
+        if isinstance(env_val, str) and env_val.strip() == "":
+            return False
+        if not config_dict:
+            return True
+        file_val = config_dict.get(section, {}).get(key) if section else config_dict.get(key)
+        if file_val is None or (isinstance(file_val, str) and file_val.strip() == ""):
+            return True
+
+        if os.getenv("KOSYNC_FORCE_ENV", "").lower() in ("1", "true", "yes"):
+            return True
+
+        norm_env = str(env_val).strip().rstrip("/")
+        norm_default = str(default_val).strip().rstrip("/") if default_val is not None else None
+        norm_file = str(file_val).strip().rstrip("/")
+
+        # If the environment variable value matches the stock default boilerplate
+        # (e.g. VFS_DIR='/vfs' or CALIBRE_LIBRARY_PATH='/calibre/library' from docker-compose / image)
+        # and the file contains a configured value, do NOT clobber the user's config file setting.
+        if norm_default is not None and norm_env.lower() == norm_default.lower():
+            return False
+
+        # If the config file already has a custom setting different from default, preserve it
+        if norm_default is not None and norm_file.lower() != norm_default.lower():
+            return False
+
+        return True
+
     # Server
-    if host := os.getenv("KOSYNC_SERVER_HOST"):
+    if (host := os.getenv("KOSYNC_SERVER_HOST")) and _should_apply("server", "host", host, "0.0.0.0"):
         config.server.host = host
-    if port := os.getenv("KOSYNC_SERVER_PORT"):
-        config.server.port = int(port)
-    if user := os.getenv("KOSYNC_AUTH_USER"):
+    if (port := os.getenv("KOSYNC_SERVER_PORT")) and _should_apply("server", "port", port, 8080):
+        try:
+            config.server.port = int(port)
+        except ValueError:
+            pass
+    if (user := os.getenv("KOSYNC_AUTH_USER")) and _should_apply("server", "auth_username", user, ""):
         config.server.auth_username = user
-    if pwd := os.getenv("KOSYNC_AUTH_PASSWORD"):
+    if (pwd := os.getenv("KOSYNC_AUTH_PASSWORD")) and _should_apply("server", "auth_password", pwd, ""):
         config.server.auth_password = pwd
 
     # Kavita
-    if kavita_url := (os.getenv("KAVITA_URL") or os.getenv("KOSYNC_KAVITA_URL")):
+    if (kavita_url := (os.getenv("KAVITA_URL") or os.getenv("KOSYNC_KAVITA_URL"))) and _should_apply("kavita", "base_url", kavita_url, "http://localhost:5000"):
         config.kavita.base_url = kavita_url.rstrip("/")
-    if kavita_key := (os.getenv("KAVITA_API_KEY") or os.getenv("KOSYNC_KAVITA_API_KEY")):
+    if (kavita_key := (os.getenv("KAVITA_API_KEY") or os.getenv("KOSYNC_KAVITA_API_KEY"))) and _should_apply("kavita", "api_key", kavita_key, ""):
         config.kavita.api_key = kavita_key
-    if kavita_enabled := os.getenv("KAVITA_ENABLED"):
+    if (kavita_enabled := os.getenv("KAVITA_ENABLED")) and _should_apply("kavita", "enabled", kavita_enabled, True):
         config.kavita.enabled = kavita_enabled.lower() in ("1", "true", "yes")
 
     # Calibre
-    if cal_path := (os.getenv("CALIBRE_LIBRARY_PATH") or os.getenv("KOSYNC_CALIBRE_PATH") or os.getenv("CALIBRE_DIR")):
+    if (cal_path := (os.getenv("CALIBRE_LIBRARY_PATH") or os.getenv("KOSYNC_CALIBRE_PATH") or os.getenv("CALIBRE_DIR"))) and _should_apply("calibre", "library_path", cal_path, "/calibre/library"):
         config.calibre.library_path = cal_path
-    if cal_enabled := os.getenv("CALIBRE_ENABLED"):
+    if (cal_enabled := os.getenv("CALIBRE_ENABLED")) and _should_apply("calibre", "enabled", cal_enabled, True):
         config.calibre.enabled = cal_enabled.lower() in ("1", "true", "yes")
-    if cal_pct := os.getenv("CALIBRE_READ_PCT_COLUMN"):
+    if (cal_pct := os.getenv("CALIBRE_READ_PCT_COLUMN")) and _should_apply("calibre", "read_pct_column", cal_pct, "#read_pct"):
         config.calibre.read_pct_column = cal_pct
-    if cal_status := os.getenv("CALIBRE_READ_STATUS_COLUMN"):
+    if (cal_status := os.getenv("CALIBRE_READ_STATUS_COLUMN")) and _should_apply("calibre", "read_status_column", cal_status, "#read_status"):
         config.calibre.read_status_column = cal_status
 
     # Sync
-    if sync_enabled := os.getenv("SYNC_ENABLED"):
+    if (sync_enabled := os.getenv("SYNC_ENABLED")) and _should_apply("sync", "enabled", sync_enabled, True):
         config.sync.enabled = sync_enabled.lower() in ("1", "true", "yes")
-    if interval := os.getenv("SYNC_INTERVAL_SECONDS"):
-        config.sync.interval_seconds = int(interval)
-    if strat := os.getenv("SYNC_CONFLICT_RESOLUTION"):
+    if (interval := os.getenv("SYNC_INTERVAL_SECONDS")) and _should_apply("sync", "interval_seconds", interval, 300):
+        try:
+            config.sync.interval_seconds = int(interval)
+        except ValueError:
+            pass
+    if (strat := os.getenv("SYNC_CONFLICT_RESOLUTION")) and _should_apply("sync", "conflict_resolution", strat, "latest_timestamp"):
         config.sync.conflict_resolution = strat
-    if scan := os.getenv("SYNC_SCAN_ON_STARTUP"):
+    if (scan := os.getenv("SYNC_SCAN_ON_STARTUP")) and _should_apply("sync", "scan_on_startup", scan, True):
         config.sync.scan_on_startup = scan.lower() in ("1", "true", "yes")
 
     # VFS
-    if vfs_enabled := os.getenv("VFS_ENABLED"):
+    if (vfs_enabled := os.getenv("VFS_ENABLED")) and _should_apply("vfs", "enabled", vfs_enabled, True):
         config.vfs.enabled = vfs_enabled.lower() in ("1", "true", "yes")
-    if vfs_dir := (os.getenv("VFS_DIR") or os.getenv("OUTPUT_DIR")):
+    if (vfs_dir := (os.getenv("VFS_DIR") or os.getenv("OUTPUT_DIR"))) and _should_apply("vfs", "vfs_dir", vfs_dir, "/vfs"):
         config.vfs.vfs_dir = vfs_dir
-    if vfs_mode := os.getenv("VFS_MODE"):
+    if (vfs_mode := os.getenv("VFS_MODE")) and _should_apply("vfs", "mode", vfs_mode, "hardlink"):
         config.vfs.mode = vfs_mode.lower()
-    if vfs_interval := (os.getenv("VFS_INTERVAL_SECONDS") or os.getenv("VFS_SYNC_INTERVAL") or os.getenv("SYNC_INTERVAL")):
+    if (vfs_interval := (os.getenv("VFS_INTERVAL_SECONDS") or os.getenv("VFS_SYNC_INTERVAL") or os.getenv("SYNC_INTERVAL"))) and _should_apply("vfs", "interval_seconds", vfs_interval, 60):
         try:
             config.vfs.interval_seconds = int(vfs_interval)
         except ValueError:
             pass
-    if rel_links := os.getenv("RELATIVE_LINKS"):
+    if (rel_links := os.getenv("RELATIVE_LINKS")) and _should_apply("vfs", "relative_links", rel_links, False):
         config.vfs.relative_links = rel_links.lower() in ("1", "true", "yes")
-    if def_lang := (os.getenv("DEFAULT_LANGUAGE") or os.getenv("VFS_DEFAULT_LANGUAGE")):
+    if (def_lang := (os.getenv("DEFAULT_LANGUAGE") or os.getenv("VFS_DEFAULT_LANGUAGE"))) and _should_apply("vfs", "default_language", def_lang, "en"):
         config.vfs.default_language = def_lang
-    if def_type := (os.getenv("DEFAULT_TYPE") or os.getenv("VFS_DEFAULT_TYPE")):
+    if (def_type := (os.getenv("DEFAULT_TYPE") or os.getenv("VFS_DEFAULT_TYPE"))) and _should_apply("vfs", "default_type", def_type, "Book"):
         config.vfs.default_type = def_type
-    if tgt_calibre := (os.getenv("CALIBRE_TARGET_DIR") or os.getenv("SYMLINK_TARGET_PREFIX")):
+    if (tgt_calibre := (os.getenv("CALIBRE_TARGET_DIR") or os.getenv("SYMLINK_TARGET_PREFIX"))) and _should_apply("vfs", "calibre_target_dir", tgt_calibre, ""):
         config.vfs.calibre_target_dir = tgt_calibre
-    if vfs_db := (os.getenv("CACHE_DB_PATH") or os.getenv("VFS_DB_PATH")):
+    if (vfs_db := (os.getenv("CACHE_DB_PATH") or os.getenv("VFS_DB_PATH"))) and _should_apply("vfs", "db_path", vfs_db, ""):
         config.vfs.db_path = vfs_db
 
     # Data dir
-    if data_dir := (os.getenv("DATA_DIR") or os.getenv("KOSYNC_DATA_DIR")):
+    if (data_dir := (os.getenv("DATA_DIR") or os.getenv("KOSYNC_DATA_DIR"))) and _should_apply(None, "data_dir", data_dir, "/app/data"):
         config.data_dir = data_dir
     elif config.data_dir == "/app/data" and not Path("/app").is_dir():
         config.data_dir = "./data"

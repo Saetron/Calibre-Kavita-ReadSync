@@ -6,10 +6,9 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # Optional environment variable overrides
+      # Optional environment variable overrides (all settings can also be configured via WebUI)
       - KAVITA_URL=http://kavita:5000
       - KAVITA_API_KEY=YOUR_KAVITA_API_KEY
-      - CALIBRE_LIBRARY_PATH=/calibre/library
       - SYNC_INTERVAL_SECONDS=300
     volumes:
       # Persistent state and audit history

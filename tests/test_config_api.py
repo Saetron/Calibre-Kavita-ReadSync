@@ -134,3 +134,76 @@ async def test_database_api_endpoints():
             assert clean_data["status"] == "success"
             assert "reclaimed_mb" in clean_data
 
+
+def test_vfs_dir_not_reset_by_default_env(monkeypatch):
+    """Verify that default VFS_DIR and CALIBRE_LIBRARY_PATH environment variables do not reset custom config.yaml values."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = os.path.join(tmpdir, "config.yaml")
+        yaml_data = {
+            "vfs": {"vfs_dir": "/data/vfs", "mode": "hardlink"},
+            "calibre": {"library_path": "/data/books"},
+        }
+        with open(config_path, "w") as f:
+            yaml.safe_dump(yaml_data, f)
+
+        # Simulate docker container environment variables providing stock defaults
+        monkeypatch.setenv("VFS_DIR", "/vfs")
+        monkeypatch.setenv("CALIBRE_LIBRARY_PATH", "/calibre/library")
+        monkeypatch.setenv("VFS_MODE", "hardlink")
+
+        loaded = load_config(config_path)
+        assert loaded.vfs.vfs_dir == "/data/vfs"
+        assert loaded.calibre.library_path == "/data/books"
+        assert loaded.vfs.mode == "hardlink"
+
+
+def test_vfs_dir_custom_env_overrides_stock_config(monkeypatch):
+    """Verify that explicit custom environment variables override stock config defaults."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = os.path.join(tmpdir, "config.yaml")
+        yaml_data = {
+            "vfs": {"vfs_dir": "/vfs"},
+        }
+        with open(config_path, "w") as f:
+            yaml.safe_dump(yaml_data, f)
+
+        # Explicit custom env var differing from stock /vfs
+        monkeypatch.setenv("VFS_DIR", "/mnt/custom_vfs")
+
+        loaded = load_config(config_path)
+        assert loaded.vfs.vfs_dir == "/mnt/custom_vfs"
+
+
+def test_vfs_dir_force_env_override(monkeypatch):
+    """Verify that KOSYNC_FORCE_ENV=1 forces environment variable overrides even over custom config."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = os.path.join(tmpdir, "config.yaml")
+        yaml_data = {
+            "vfs": {"vfs_dir": "/data/vfs"},
+        }
+        with open(config_path, "w") as f:
+            yaml.safe_dump(yaml_data, f)
+
+        monkeypatch.setenv("VFS_DIR", "/forced/vfs")
+        monkeypatch.setenv("KOSYNC_FORCE_ENV", "1")
+
+        loaded = load_config(config_path)
+        assert loaded.vfs.vfs_dir == "/forced/vfs"
+
+
+def test_env_fills_empty_setting_in_config(monkeypatch):
+    """Verify that env var populates empty/unspecified settings in config."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = os.path.join(tmpdir, "config.yaml")
+        yaml_data = {
+            "kavita": {"api_key": ""},
+        }
+        with open(config_path, "w") as f:
+            yaml.safe_dump(yaml_data, f)
+
+        monkeypatch.setenv("KAVITA_API_KEY", "env_secret_key_123")
+
+        loaded = load_config(config_path)
+        assert loaded.kavita.api_key == "env_secret_key_123"
+
+
