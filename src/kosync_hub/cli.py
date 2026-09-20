@@ -293,5 +293,35 @@ def status(ctx, config_path: Optional[str] = None):
     console.print(table)
 
 
+@cli.command("db-cleanup")
+@click.option("--days", default=14, type=int, help="Keep events newer than N days (default: 14).")
+@click.option("--max-events", default=5000, type=int, help="Keep at most N sync events (default: 5000).")
+@click.option("--clear-hashes", is_flag=True, default=False, help="Purge speculative filename hashes table (~300MB).")
+@click.option("--vacuum/--no-vacuum", default=True, help="Run SQLite VACUUM to reclaim free space on disk.")
+@click.option("--config", "-c", "config_path", help="Path to config.yaml file.")
+@click.pass_context
+def db_cleanup(ctx, days: int, max_events: int, clear_hashes: bool, vacuum: bool, config_path: Optional[str] = None):
+    """Prunes old sync events, clears filename hashes cache, and vacuums kosync_hub.sqlite3."""
+    config: AppConfig = get_config(ctx, config_path)
+    db, _, _, _, _ = init_components(config)
+
+    with console.status("Running database cleanup..."):
+        res = db.cleanup_all(
+            retention_days=days,
+            max_events=max_events,
+            clear_hashes=clear_hashes,
+            vacuum_db=vacuum,
+        )
+
+    console.print(
+        f"[bold green]✔ Database cleanup completed![/bold green]\n"
+        f"  • Old events deleted: [cyan]{res['events_deleted']}[/cyan]\n"
+        f"  • Filename hashes cleared: [cyan]{res['hashes_deleted']}[/cyan]\n"
+        f"  • Size before: [yellow]{res['size_initial_mb']} MB[/yellow] ➔ Size after: [green]{res['size_final_mb']} MB[/green]\n"
+        f"  • Reclaimed disk space: [bold green]{res['reclaimed_mb']} MB[/bold green]"
+    )
+
+
 if __name__ == "__main__":
     cli()
+

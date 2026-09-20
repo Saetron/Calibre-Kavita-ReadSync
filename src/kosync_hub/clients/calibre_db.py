@@ -164,6 +164,19 @@ class CalibreDbClient(BaseSyncClient):
         cursor = conn.execute("SELECT id, label, datatype FROM custom_columns WHERE mark_for_delete = 0")
         self._column_cache = {row["label"]: (row["id"], row["datatype"]) for row in cursor.fetchall()}
 
+    def _resolve_column(self, label: str) -> Optional[tuple[int, str]]:
+        """Resolves a custom column label to its (col_id, table_name)."""
+        if not label:
+            return None
+        clean_label = label.lstrip("#")
+        with self._get_connection() as conn:
+            if clean_label not in self._column_cache:
+                self._refresh_column_cache(conn)
+            if clean_label in self._column_cache:
+                col_id, _ = self._column_cache[clean_label]
+                return (col_id, f"custom_column_{col_id}")
+        return None
+
     def _ensure_custom_columns(self, conn: sqlite3.Connection):
         """Ensures that required custom columns exist in metadata.db, creating them if missing."""
         self._refresh_column_cache(conn)
@@ -906,3 +919,349 @@ class CalibreDbClient(BaseSyncClient):
             progress_str=record.progress,
             timestamp=record.timestamp,
         )
+
+    # -------------------------------------------------------------------------
+    # Calibre Library & Reading History Analytics
+    # -------------------------------------------------------------------------
+
+    def get_library_statistics(self) -> Dict[str, Any]:
+        """Calculates comprehensive library analytics from Calibre's metadata.db."""
+        if not self.db_path.is_file():
+            return {"error": "Calibre database not found"}
+
+        with self._get_connection() as conn:
+            def _scalar(sql: str, default=0):
+                try:
+                    res = conn.execute(sql).fetchone()
+                    return res[0] if res and res[0] is not None else default
+                except Exception:
+                    return default
+
+            total_books = _scalar("SELECT COUNT(*) FROM books")
+            total_authors = _scalar("SELECT COUNT(*) FROM authors")
+            total_series = _scalar("SELECT COUNT(*) FROM series")
+            total_tags = _scalar("SELECT COUNT(*) FROM tags")
+            total_publishers = _scalar("SELECT COUNT(*) FROM publishers")
+            total_languages = _scalar("SELECT COUNT(*) FROM languages")
+            total_size = _scalar("SELECT SUM(uncompressed_size) FROM data")
+
+            # Formats breakdown
+            formats = []
+            try:
+                cur = conn.execute(
+                    """
+                    SELECT format, COUNT(*) AS count, SUM(uncompressed_size) AS size
+                    FROM data
+                    WHERE format IS NOT NULL AND format != ''
+                    GROUP BY format
+                    ORDER BY count DESC
+                    """
+                )
+                for r in cur.fetchall():
+                    sz = r["size"] or 0
+                    formats.append({
+                        "format": r["format"].upper(),
+                        "count": r["count"],
+                        "size_bytes": sz,
+                        "size_mb": round(sz / (1024 * 1024), 2),
+                    })
+            except Exception as e:
+                logger.debug(f"Error fetching formats: {e}")
+
+            # Top 10 Authors
+            top_authors = []
+            try:
+                cur = conn.execute(
+                    """
+                    SELECT a.name, COUNT(bal.book) AS book_count
+                    FROM books_authors_link bal
+                    JOIN authors a ON bal.author = a.id
+                    GROUP BY a.id
+                    ORDER BY book_count DESC
+                    LIMIT 10
+                    """
+                )
+                top_authors = [{"name": r["name"], "count": r["book_count"]} for r in cur.fetchall()]
+            except Exception as e:
+                logger.debug(f"Error fetching top authors: {e}")
+
+            # Top 10 Series
+            top_series = []
+            try:
+                cur = conn.execute(
+                    """
+                    SELECT s.name, COUNT(bsl.book) AS book_count
+                    FROM books_series_link bsl
+                    JOIN series s ON bsl.series = s.id
+                    GROUP BY s.id
+                    ORDER BY book_count DESC
+                    LIMIT 10
+                    """
+                )
+                top_series = [{"name": r["name"], "count": r["book_count"]} for r in cur.fetchall()]
+            except Exception as e:
+                logger.debug(f"Error fetching top series: {e}")
+
+            # Top 15 Tags / Genres
+            top_tags = []
+            try:
+                cur = conn.execute(
+                    """
+                    SELECT t.name, COUNT(btl.book) AS book_count
+                    FROM books_tags_link btl
+                    JOIN tags t ON btl.tag = t.id
+                    GROUP BY t.id
+                    ORDER BY book_count DESC
+                    LIMIT 15
+                    """
+                )
+                top_tags = [{"name": r["name"], "count": r["book_count"]} for r in cur.fetchall()]
+            except Exception as e:
+                logger.debug(f"Error fetching top tags: {e}")
+
+            # Publication Years Distribution (recent 15 years with books)
+            pub_years = []
+            try:
+                cur = conn.execute(
+                    """
+                    SELECT strftime('%Y', pubdate) AS yr, COUNT(*) AS count
+                    FROM books
+                    WHERE pubdate IS NOT NULL AND yr > '1900' AND yr <= strftime('%Y', 'now')
+                    GROUP BY yr
+                    ORDER BY yr DESC
+                    LIMIT 15
+                    """
+                )
+                pub_years = [{"year": r["yr"], "count": r["count"]} for r in cur.fetchall()]
+            except Exception as e:
+                logger.debug(f"Error fetching pub years: {e}")
+
+            return {
+                "total_books": total_books,
+                "total_authors": total_authors,
+                "total_series": total_series,
+                "total_tags": total_tags,
+                "total_publishers": total_publishers,
+                "total_languages": total_languages,
+                "total_size_bytes": total_size,
+                "total_size_gb": round(total_size / (1024 * 1024 * 1024), 2) if total_size else 0.0,
+                "formats": formats,
+                "top_authors": top_authors,
+                "top_series": top_series,
+                "top_tags": top_tags,
+                "pub_years": pub_years,
+            }
+
+    def get_reading_history_analytics(self, year: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Generates reading history analytics and Year-in-Review metrics.
+        Combines Calibre custom columns (#read_pct, #read_status, #last_read)
+        with internal database tracked_documents.
+        """
+        if not self.db_path.is_file():
+            return {"error": "Calibre database not found"}
+
+        import datetime
+
+        now_year = datetime.datetime.utcnow().year
+        selected_year = year or now_year
+
+        read_col = self._resolve_column(self.read_pct_label)
+        last_read_col = self._resolve_column(self.last_read_label)
+        status_col = self._resolve_column(self.read_status_label)
+
+        completed_books = []
+        available_years = set()
+        in_progress_count = 0
+        total_finished_all_time = 0
+
+        # 1. Read from Calibre DB
+        with self._get_connection() as conn:
+            author_cursor = conn.execute("""
+                SELECT bal.book, a.name
+                FROM books_authors_link bal
+                JOIN authors a ON bal.author = a.id
+            """)
+            book_authors: Dict[int, List[str]] = {}
+            for ar in author_cursor.fetchall():
+                book_authors.setdefault(ar["book"], []).append(ar["name"])
+
+            tags_cursor = conn.execute("""
+                SELECT btl.book, t.name
+                FROM books_tags_link btl
+                JOIN tags t ON btl.tag = t.id
+            """)
+            book_tags: Dict[int, List[str]] = {}
+            for tr in tags_cursor.fetchall():
+                book_tags.setdefault(tr["book"], []).append(tr["name"])
+
+            query_parts = ["SELECT b.id, b.title"]
+            joins = []
+            if read_col:
+                query_parts.append(f"c_pct.value AS read_pct")
+                joins.append(f"LEFT JOIN {read_col[1]} c_pct ON b.id = c_pct.book")
+            if last_read_col:
+                query_parts.append(f"c_date.value AS last_read")
+                joins.append(f"LEFT JOIN {last_read_col[1]} c_date ON b.id = c_date.book")
+            if status_col:
+                query_parts.append(f"c_stat.value AS read_status")
+                joins.append(f"LEFT JOIN {status_col[1]} c_stat ON b.id = c_stat.book")
+
+            sql = f"{', '.join(query_parts)} FROM books b {' '.join(joins)}"
+            cursor = conn.execute(sql)
+            rows = cursor.fetchall()
+
+            for r in rows:
+                bid = r["id"]
+                title = r["title"] or "Untitled"
+                authors_str = ", ".join(book_authors.get(bid, []))
+                tags_list = book_tags.get(bid, [])
+
+                pct = 0.0
+                if read_col and "read_pct" in r.keys() and r["read_pct"] is not None:
+                    try:
+                        p_val = float(r["read_pct"])
+                        pct = p_val / 100.0 if p_val > 1.0 else p_val
+                    except (ValueError, TypeError):
+                        pct = 0.0
+
+                is_status_read = False
+                if status_col and "read_status" in r.keys() and r["read_status"]:
+                    is_status_read = bool(r["read_status"])
+
+                is_completed = (pct >= self.mark_read_threshold) or is_status_read
+                if is_completed:
+                    total_finished_all_time += 1
+                elif pct > 0.0:
+                    in_progress_count += 1
+
+                # Parse finish date
+                date_str = None
+                book_yr = None
+                book_month = None
+                if last_read_col and "last_read" in r.keys() and r["last_read"]:
+                    raw_dt = str(r["last_read"])
+                    try:
+                        # Calibre dates can be 'YYYY-MM-DD HH:MM:SS' or ISO or timestamp
+                        if raw_dt.isdigit():
+                            dt = datetime.datetime.fromtimestamp(int(raw_dt))
+                        else:
+                            clean_dt = raw_dt.split("+")[0].split(".")[0].strip()
+                            dt = datetime.datetime.fromisoformat(clean_dt)
+                        book_yr = dt.year
+                        book_month = dt.strftime("%b")
+                        date_str = dt.strftime("%Y-%m-%d")
+                        available_years.add(book_yr)
+                    except Exception:
+                        pass
+
+                if is_completed and book_yr:
+                    completed_books.append({
+                        "id": bid,
+                        "title": title,
+                        "authors": authors_str,
+                        "tags": tags_list,
+                        "year": book_yr,
+                        "month": book_month,
+                        "date": date_str,
+                        "percentage": 100.0,
+                    })
+
+        # 2. Also check internal_db tracked_documents to enrich completed books
+        if self.internal_db:
+            try:
+                tracked = self.internal_db.get_all_tracked_documents()
+                for d in tracked:
+                    d_pct = float(d["percentage"] or 0.0)
+                    if d_pct >= self.mark_read_threshold:
+                        ts = d["timestamp"]
+                        if ts:
+                            dt = datetime.datetime.fromtimestamp(ts)
+                            available_years.add(dt.year)
+                            b_id = d["calibre_book_id"]
+                            # Check if already present
+                            if not any(b["id"] == b_id for b in completed_books if b_id):
+                                completed_books.append({
+                                    "id": b_id or d["document"][:8],
+                                    "title": d["title"] or "Untitled",
+                                    "authors": d["authors"] or "",
+                                    "tags": [],
+                                    "year": dt.year,
+                                    "month": dt.strftime("%b"),
+                                    "date": dt.strftime("%Y-%m-%d"),
+                                    "percentage": round(d_pct * 100, 1),
+                                })
+            except Exception as e:
+                logger.debug(f"Error enriching from internal_db: {e}")
+
+        # Always include current year and previous year in available_years
+        available_years.add(now_year)
+        available_years.add(now_year - 1)
+        sorted_years = sorted(list(available_years), reverse=True)
+
+        # Filter completed books for the selected year
+        if selected_year == "all" or selected_year == 0:
+            year_books = completed_books
+            display_year_str = "All Time"
+        else:
+            try:
+                selected_year = int(selected_year)
+            except (ValueError, TypeError):
+                selected_year = now_year
+            year_books = [b for b in completed_books if b["year"] == selected_year]
+            display_year_str = str(selected_year)
+
+        # Monthly breakdown (Jan - Dec)
+        months_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        monthly_counts = {m: 0 for m in months_order}
+        for b in year_books:
+            if b.get("month") in monthly_counts:
+                monthly_counts[b["month"]] += 1
+
+        # Peak month
+        peak_month = "-"
+        max_month_books = 0
+        for m, cnt in monthly_counts.items():
+            if cnt > max_month_books:
+                max_month_books = cnt
+                peak_month = f"{m} ({cnt} books)"
+
+        # Top Authors read in selected year
+        year_authors = {}
+        year_tags = {}
+        for b in year_books:
+            if b.get("authors"):
+                for a in [x.strip() for x in b["authors"].split(",")]:
+                    if a:
+                        year_authors[a] = year_authors.get(a, 0) + 1
+            if b.get("tags"):
+                for t in b["tags"]:
+                    year_tags[t] = year_tags.get(t, 0) + 1
+
+        top_read_authors = [
+            {"name": k, "count": v}
+            for k, v in sorted(year_authors.items(), key=lambda item: item[1], reverse=True)[:5]
+        ]
+        top_read_tags = [
+            {"name": k, "count": v}
+            for k, v in sorted(year_tags.items(), key=lambda item: item[1], reverse=True)[:8]
+        ]
+
+        # Estimated pages read (assume 320 pages average per finished book)
+        est_pages = len(year_books) * 320
+
+        return {
+            "selected_year": selected_year,
+            "display_year": display_year_str,
+            "available_years": sorted_years,
+            "books_completed": len(year_books),
+            "total_finished_all_time": total_finished_all_time,
+            "in_progress": in_progress_count,
+            "estimated_pages": est_pages,
+            "peak_month": peak_month,
+            "monthly_counts": monthly_counts,
+            "top_read_authors": top_read_authors,
+            "top_read_tags": top_read_tags,
+            "books": sorted(year_books, key=lambda b: b.get("date") or "", reverse=True),
+        }
+

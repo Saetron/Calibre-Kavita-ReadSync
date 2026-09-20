@@ -1064,7 +1064,23 @@ class InternalDatabase:
                 (one_week_ago,),
             ).fetchone()[0]
 
-            # Aliased devices count
+            # Distinct connected devices (a device with the same name counts as one)
+            dev_rows = conn.execute("""
+                SELECT DISTINCT NULLIF(TRIM(device), '') AS dev
+                FROM (
+                    SELECT device FROM tracked_documents WHERE device IS NOT NULL AND device != ''
+                    UNION
+                    SELECT device FROM document_aliases WHERE device IS NOT NULL AND device != ''
+                )
+                WHERE dev IS NOT NULL
+            """).fetchall()
+            device_names = [r["dev"] for r in dev_rows if r["dev"]]
+            devices_count = len(device_names)
+            if devices_count == 0 and tracked_count > 0:
+                devices_count = 1
+                device_names = ["KOReader"]
+
+            # Aliased document hashes count
             alias_count = conn.execute("SELECT COUNT(*) FROM document_aliases").fetchone()[0]
 
             return {
@@ -1074,4 +1090,159 @@ class InternalDatabase:
                 "syncs_today": syncs_today,
                 "syncs_week": syncs_week,
                 "aliases_count": alias_count,
+                "devices_count": devices_count,
+                "device_names": device_names,
             }
+
+    # -------------------------------------------------------------------------
+    # Database Maintenance, Sizing & Cleanup
+    # -------------------------------------------------------------------------
+
+    def get_database_size_bytes(self) -> int:
+        """Returns the file size of the database on disk in bytes."""
+        try:
+            if self.db_path.is_file():
+                return self.db_path.stat().st_size
+        except Exception:
+            pass
+        return 0
+
+    def get_table_counts(self) -> dict:
+        """Returns row counts for all main tables in the internal database."""
+        with self._get_connection() as conn:
+            def _cnt(table: str) -> int:
+                try:
+                    return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                except Exception:
+                    return 0
+
+            return {
+                "tracked_documents": _cnt("tracked_documents"),
+                "sync_events": _cnt("sync_events"),
+                "document_aliases": _cnt("document_aliases"),
+                "book_mappings": _cnt("book_mappings"),
+                "filename_hashes": _cnt("filename_hashes"),
+                "file_size_bytes": self.get_database_size_bytes(),
+            }
+
+    def cleanup_sync_events(self, retention_days: int = 14, max_events: int = 5000) -> int:
+        """
+        Prunes old sync_events records:
+        1. Deletes events older than retention_days.
+        2. Caps the remaining table size to max_events (keeps most recent).
+        Returns number of deleted rows.
+        """
+        import time
+        cutoff = int(time.time()) - (retention_days * 86400)
+        deleted = 0
+
+        with self._get_connection() as conn:
+            # 1. Delete events older than cutoff
+            cur = conn.execute("DELETE FROM sync_events WHERE timestamp < ?", (cutoff,))
+            deleted += cur.rowcount
+
+            # 2. Cap total events to max_events
+            cur_total = conn.execute("SELECT COUNT(*) FROM sync_events").fetchone()[0]
+            if cur_total > max_events:
+                excess = cur_total - max_events
+                cur2 = conn.execute(
+                    """
+                    DELETE FROM sync_events
+                    WHERE id IN (
+                        SELECT id FROM sync_events
+                        ORDER BY timestamp ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (excess,),
+                )
+                deleted += cur2.rowcount
+
+            conn.commit()
+
+        if deleted > 0:
+            logger.info(f"Cleaned up {deleted} old sync_events from internal database.")
+        return deleted
+
+    def clear_filename_hashes(self) -> int:
+        """
+        Clears the filename_hashes candidate cache table.
+        This immediately frees hundreds of megabytes if millions of candidate hashes were indexed.
+        Active books remain permanently tracked in document_aliases and tracked_documents.
+        """
+        deleted = 0
+        with self._get_connection() as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM filename_hashes")
+            deleted = cur.fetchone()[0]
+            conn.execute("DELETE FROM filename_hashes")
+            conn.execute("DELETE FROM hub_metadata WHERE key IN ('filename_index_version', 'last_filename_index_time')")
+            conn.commit()
+
+        logger.info(f"Cleared {deleted} cached candidate filename hashes from internal database.")
+        return deleted
+
+    def vacuum(self) -> dict:
+        """
+        Executes SQLite VACUUM to physically reclaim deleted space and shrink the file on disk.
+        Also runs PRAGMA optimize for optimal index query performance.
+        Returns size before, size after, and reclaimed bytes.
+        """
+        size_before = self.get_database_size_bytes()
+        with self._get_connection() as conn:
+            # VACUUM cannot run within a multi-statement transaction
+            conn.isolation_level = None
+            conn.execute("VACUUM")
+            conn.execute("PRAGMA optimize")
+
+        size_after = self.get_database_size_bytes()
+        reclaimed = max(0, size_before - size_after)
+        logger.info(
+            f"Database VACUUM completed: {round(size_before / (1024*1024), 2)} MB -> "
+            f"{round(size_after / (1024*1024), 2)} MB (reclaimed {round(reclaimed / (1024*1024), 2)} MB)."
+        )
+        return {
+            "size_before_bytes": size_before,
+            "size_after_bytes": size_after,
+            "reclaimed_bytes": reclaimed,
+            "size_before_mb": round(size_before / (1024 * 1024), 2),
+            "size_after_mb": round(size_after / (1024 * 1024), 2),
+            "reclaimed_mb": round(reclaimed / (1024 * 1024), 2),
+        }
+
+    def cleanup_all(
+        self,
+        retention_days: int = 14,
+        max_events: int = 5000,
+        clear_hashes: bool = False,
+        vacuum_db: bool = True,
+    ) -> dict:
+        """
+        Performs a full maintenance pass on the internal database:
+        - Prunes old sync_events.
+        - Optionally clears candidate filename_hashes.
+        - Optionally runs VACUUM to reclaim disk space.
+        """
+        size_initial = self.get_database_size_bytes()
+        events_deleted = self.cleanup_sync_events(retention_days=retention_days, max_events=max_events)
+        hashes_deleted = self.clear_filename_hashes() if clear_hashes else 0
+
+        vacuum_res = {}
+        if vacuum_db:
+            vacuum_res = self.vacuum()
+
+        size_final = self.get_database_size_bytes()
+        reclaimed = max(0, size_initial - size_final)
+
+        return {
+            "status": "success",
+            "events_deleted": events_deleted,
+            "hashes_deleted": hashes_deleted,
+            "size_initial_bytes": size_initial,
+            "size_final_bytes": size_final,
+            "reclaimed_bytes": reclaimed,
+            "size_initial_mb": round(size_initial / (1024 * 1024), 2),
+            "size_final_mb": round(size_final / (1024 * 1024), 2),
+            "reclaimed_mb": round(reclaimed / (1024 * 1024), 2),
+            "vacuum": vacuum_res,
+        }
+

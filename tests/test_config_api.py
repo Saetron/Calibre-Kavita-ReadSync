@@ -103,3 +103,34 @@ async def test_vfs_endpoints():
             sync_res = await client.post("/api/vfs/sync")
             assert sync_res.status_code == 200
             assert sync_res.json()["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_database_api_endpoints():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = AppConfig(data_dir=tmpdir)
+        db_path = os.path.join(tmpdir, "test.db")
+        db = InternalDatabase(db_path)
+        sync = Synchronizer(db=db)
+        vfs = VFSManager(config)
+
+        app = create_app(config=config, db=db, synchronizer=sync, vfs_manager=vfs)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # 1. GET /api/database/status
+            res = await client.get("/api/database/status")
+            assert res.status_code == 200
+            status_data = res.json()
+            assert "counts" in status_data
+            assert "size_bytes" in status_data
+
+            # 2. POST /api/database/cleanup
+            clean_res = await client.post(
+                "/api/database/cleanup",
+                json={"retention_days": 7, "max_events": 100, "clear_hashes": True, "vacuum": True},
+            )
+            assert clean_res.status_code == 200
+            clean_data = clean_res.json()
+            assert clean_data["status"] == "success"
+            assert "reclaimed_mb" in clean_data
+
