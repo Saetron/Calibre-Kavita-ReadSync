@@ -1,5 +1,5 @@
 # ==============================================================================
-# KOReader Multi-Sync Hub Configuration
+# Calibre-Kavita-ReadSync (kosync-hub) Configuration
 # ==============================================================================
 
 server:
@@ -32,12 +32,41 @@ calibre:
   # Mark read status as true when percentage reaches or exceeds this threshold (0.98 = 98%)
   mark_read_threshold: 0.98
 
+# ------------------------------------------------------------------------------
+# KOReader Reading Progress Sync (Independent option)
+# ------------------------------------------------------------------------------
 sync:
+  enabled: true
   # Background sync frequency in seconds (default: 300 = 5 minutes)
   interval_seconds: 300
   # Conflict resolution strategy: 'latest_timestamp' (recommended) or 'highest_percentage'
   conflict_resolution: "latest_timestamp"
   # On startup, scan the Calibre library and index KOReader partial MD5 hashes
   scan_on_startup: true
+
+# ------------------------------------------------------------------------------
+# Kavita VFS Virtual File System Generator (Independent option)
+# ------------------------------------------------------------------------------
+vfs:
+  enabled: true
+  # Target directory where the formatted Kavita library will be generated
+  vfs_dir: "/vfs"
+  # Mode: 'hardlink' (recommended default), 'symlink', or 'fuse'
+  mode: "hardlink"
+  # Background sync check interval in seconds (detects metadata.db changes)
+  interval_seconds: 60
+  # If using symlinks: use relative paths instead of absolute
+  relative_links: false
+  # Fallback language and type if not set in Calibre
+  default_language: "unknown"
+  default_type: "Unknown"
+  # Optional custom path prefix written into symlinks (e.g. host path /mnt/user/... or Kavita path)
+  # calibre_target_dir: "/mnt/user/data/calibre/library"
+  # Optional custom path for internal delta sync database (defaults to data_dir/vfs_cache.db)
+  # db_path: "/app/data/vfs_cache.db"
+  # Calibre custom column names for VFS organization
+  custom_type_column: "type"
+  custom_volume_column: "volume"
+  custom_chapter_column: "chapter"
 
 data_dir: "/app/data"

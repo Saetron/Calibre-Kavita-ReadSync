@@ -16,8 +16,10 @@ class ProgressPayload(BaseModel):
     document: str
     progress: str
     percentage: float
+    timestamp: Optional[int] = None
     device: Optional[str] = "KOReader"
     device_id: Optional[str] = None
+    calibre_id: Optional[int] = None
     metadata: Optional[DocumentMetadata] = None
     position: Optional[Dict[str, Any]] = None  # CrossPoint rich position extension
 
