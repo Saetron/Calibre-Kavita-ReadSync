@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-from ..hasher import compute_all_book_hashes, compute_koreader_partial_md5
+from ..hasher import compute_all_book_hashes, compute_filename_md5, compute_koreader_partial_md5
 from ..models import CalibreBookRecord, ProgressRecord
 from .base import BaseSyncClient
 
@@ -50,6 +50,8 @@ class CalibreDbClient(BaseSyncClient):
         self._column_cache: Dict[str, Tuple[int, str]] = {}
         self._hash_cache: Dict[str, int] = {}
         self._id_hash_cache: Dict[int, str] = {}
+        self._filename_hash_cache: Dict[str, int] = {}
+        self._filename_cache_loaded: bool = False
 
     @property
     def name(self) -> str:
@@ -188,8 +190,109 @@ class CalibreDbClient(BaseSyncClient):
                         return hsh
         return None
 
+    def _load_filename_hashes(self, conn: sqlite3.Connection):
+        """Indexes filename MD5s for books in Calibre DB for KOReader/CrossPoint filename sync."""
+        try:
+            cursor = conn.execute("""
+                SELECT b.id, b.title, b.path, d.name, d.format
+                FROM books b
+                LEFT JOIN data d ON b.id = d.book
+            """)
+            rows = cursor.fetchall()
+
+            author_cursor = conn.execute("""
+                SELECT bal.book, a.name
+                FROM books_authors_link bal
+                JOIN authors a ON bal.author = a.id
+            """)
+            book_authors: Dict[int, List[str]] = {}
+            for ar in author_cursor.fetchall():
+                book_authors.setdefault(ar["book"], []).append(ar["name"])
+
+            for r in rows:
+                bid = r["id"]
+                title = r["title"] or ""
+                b_path = r["path"] or ""
+                folder_name = Path(b_path).name if b_path else ""
+                d_name = r["name"] or ""
+                fmt = (r["format"] or "epub").lower()
+                authors_list = book_authors.get(bid, [])
+                authors_str = ", ".join(authors_list)
+
+                candidates = set()
+                # 1. Calibre internal filename
+                if d_name:
+                    candidates.add(f"{d_name}.{fmt}")
+                    candidates.add(f"{d_name}.{fmt.upper()}")
+                    candidates.add(f"{d_name}.kepub.epub")
+                    candidates.add(d_name)
+                # 2. Folder name (e.g. Title (123))
+                if folder_name:
+                    candidates.add(f"{folder_name}.{fmt}")
+                    candidates.add(f"{folder_name}.kepub.epub")
+                    candidates.add(folder_name)
+                # 3. Title variations
+                if title:
+                    candidates.add(f"{title}.{fmt}")
+                    candidates.add(f"{title}.kepub.epub")
+                    candidates.add(title)
+                    candidates.add(f"{title} ({bid}).{fmt}")
+                    candidates.add(f"{title} {{{bid}}}.{fmt}")
+                    candidates.add(f"{title} [{bid}].{fmt}")
+                    candidates.add(f"{title} - {bid}.{fmt}")
+                    candidates.add(f"{title}_{bid}.{fmt}")
+                    candidates.add(f"{bid} - {title}.{fmt}")
+                    candidates.add(f"{bid}_{title}.{fmt}")
+                # 4. Standalone ID patterns
+                candidates.add(f"{bid}.{fmt}")
+                candidates.add(f"{bid}.kepub.epub")
+                # 5. Author + title patterns
+                if authors_str and title:
+                    candidates.add(f"{title} - {authors_str}.{fmt}")
+                    candidates.add(f"{title} - {authors_str} ({bid}).{fmt}")
+                    candidates.add(f"{title} - {authors_str} {{{bid}}}.{fmt}")
+                    candidates.add(f"{title} - {authors_str} [{bid}].{fmt}")
+                    candidates.add(f"{authors_str} - {title}.{fmt}")
+                    candidates.add(f"{authors_str} - {title} ({bid}).{fmt}")
+                    candidates.add(f"{authors_str} - {title} {{{bid}}}.{fmt}")
+                    candidates.add(f"{authors_str} - {title} [{bid}].{fmt}")
+
+                # 6. Physical files on disk if library path accessible
+                if b_path and self.library_path:
+                    try:
+                        book_dir = self.library_path / b_path
+                        if book_dir.is_dir():
+                            for f in book_dir.iterdir():
+                                if f.is_file():
+                                    candidates.add(f.name)
+                                    candidates.add(f.stem)
+                    except Exception:
+                        pass
+
+                for c in candidates:
+                    if c:
+                        h = compute_filename_md5(c)
+                        self._filename_hash_cache[h] = bid
+                        h_lower = compute_filename_md5(c.lower())
+                        self._filename_hash_cache[h_lower] = bid
+
+            self._filename_cache_loaded = True
+        except Exception as e:
+            logger.warning(f"Error loading filename hashes from Calibre DB: {e}")
+
+    def find_book_by_filename_hash(self, document_hash: str) -> Optional[int]:
+        """Looks up a book ID by the MD5 hash of candidate filenames."""
+        if not document_hash:
+            return None
+        if document_hash in self._filename_hash_cache:
+            return self._filename_hash_cache[document_hash]
+
+        with self._get_connection() as conn:
+            self._load_filename_hashes(conn)
+            return self._filename_hash_cache.get(document_hash)
+
     def find_book_by_hash(self, document_hash: str) -> Optional[int]:
-        """Looks up a book ID by KOReader or MD5 identifier."""
+        """Looks up a book ID by KOReader or MD5 identifier or filename hash."""
         if not document_hash:
             return None
         if document_hash in self._hash_cache:
@@ -210,6 +313,13 @@ class CalibreDbClient(BaseSyncClient):
                 self._hash_cache[document_hash] = book_id
                 self._id_hash_cache[book_id] = document_hash
                 return book_id
+
+        # Fallback to filename hash
+        fn_match = self.find_book_by_filename_hash(document_hash)
+        if fn_match:
+            self._hash_cache[document_hash] = fn_match
+            return fn_match
+
         return None
 
     def link_book_hash(self, book_id: int, document_hash: str):
@@ -553,12 +663,23 @@ class CalibreDbClient(BaseSyncClient):
     async def update_progress(self, record: ProgressRecord) -> bool:
         """BaseSyncClient compatibility: update progress by record."""
         book_id = record.calibre_id or self.find_book_by_hash(record.document)
-        if not book_id:
-            if record.filename:
-                # Check for {id} in filename
-                match = re.search(r"\{(\d+)\}", record.filename)
-                if match:
-                    book_id = int(match.group(1))
+        if not book_id and record.document:
+            book_id = self.find_book_by_filename_hash(record.document)
+
+        if not book_id and record.filename:
+            # Check for id in filename: {123}, (123), [123], _123, - 123
+            for pat in [r"\{(\d+)\}", r"\((\d+)\)", r"\[(\d+)\]", r"[-_](\d+)\b"]:
+                m = re.search(pat, record.filename)
+                if m:
+                    cand_id = int(m.group(1))
+                    if self.get_book_by_id(cand_id):
+                        book_id = cand_id
+                        break
+
+            if not book_id:
+                # Check filename hash of the given filename string directly
+                fn_hash = compute_filename_md5(record.filename)
+                book_id = self.find_book_by_filename_hash(fn_hash)
 
             if not book_id:
                 # Check filename or title/author fallback

@@ -45,7 +45,15 @@ class Synchronizer:
         else:
             calibre_id = self.db.get_calibre_id_for_document(document)
 
+        if not calibre_id and self.calibre and hasattr(self.calibre, "find_book_by_hash"):
+            calibre_id = self.calibre.find_book_by_hash(document)
+            if not calibre_id and hasattr(self.calibre, "find_book_by_filename_hash"):
+                calibre_id = self.calibre.find_book_by_filename_hash(document)
+            if calibre_id:
+                self.db.link_document_alias(document, calibre_id, "KOReader")
+
         canonical_hash = document
+        cal_book = None
         if calibre_id:
             # Check if there is a canonical document hash or Calibre record
             if self.calibre and hasattr(self.calibre, "get_book_by_id"):
@@ -59,14 +67,12 @@ class Synchronizer:
                         records.append(c_rec)
 
         if self.kavita:
-            # Check Kavita with both the requested hash and canonical hash
+            # Check Kavita with the canonical hash
             k_rec = await self.kavita.get_progress(canonical_hash)
-            if not k_rec and canonical_hash != document:
-                k_rec = await self.kavita.get_progress(document)
             if k_rec:
                 records.append(k_rec)
 
-        if self.calibre and canonical_hash == document:
+        if self.calibre and canonical_hash == document and not records:
             c_rec = await self.calibre.get_progress(document)
             if c_rec:
                 records.append(c_rec)

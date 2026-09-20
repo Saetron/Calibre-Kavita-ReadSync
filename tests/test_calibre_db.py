@@ -180,3 +180,34 @@ def test_normalize_string():
     assert normalize_string("Dune: A Novel") == "dune"
     assert normalize_string("The Hobbit - Special Edition") == "the hobbit"
     assert normalize_string("F. Scott Fitzgerald") == "f scott fitzgerald"
+
+
+@pytest.mark.asyncio
+async def test_calibre_filename_hash_lookup():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        lib_dir = Path(tmpdir)
+        create_mock_calibre_db(lib_dir)
+
+        from kosync_hub.hasher import compute_filename_md5
+        client = CalibreDbClient(library_path=str(lib_dir))
+        await client.test_connection()
+
+        # 1. Matches exact Calibre data filename "Dune - Frank Herbert.epub"
+        h1 = compute_filename_md5("Dune - Frank Herbert.epub")
+        assert client.find_book_by_filename_hash(h1) == 1
+
+        # 2. Matches folder name with format "Dune (1).epub"
+        h2 = compute_filename_md5("Dune (1).epub")
+        assert client.find_book_by_filename_hash(h2) == 1
+
+        # 3. Matches title with ID in curly braces "Dune {1}.epub"
+        h3 = compute_filename_md5("Dune {1}.epub")
+        assert client.find_book_by_filename_hash(h3) == 1
+
+        # 4. Matches just title "Dune.epub"
+        h4 = compute_filename_md5("Dune.epub")
+        assert client.find_book_by_filename_hash(h4) == 1
+
+        # 5. Non-existent book returns None
+        h_none = compute_filename_md5("Unknown Book 999.epub")
+        assert client.find_book_by_filename_hash(h_none) is None

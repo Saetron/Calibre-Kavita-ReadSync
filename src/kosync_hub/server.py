@@ -5,6 +5,7 @@ import logging
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
@@ -12,10 +13,33 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from .config import AppConfig
 from .db import InternalDatabase
+from .hasher import compute_filename_md5
 from .models import HubStatus, ProgressPayload, ProgressRecord, ProgressResponse, SyncEvent, UserAuthRequest
 from .synchronizer import Synchronizer
 
 logger = logging.getLogger("kosync_hub.server")
+
+
+def extract_calibre_id_from_filename(filename: Optional[str]) -> Optional[int]:
+    """Extracts a potential Calibre ID from filename using various common patterns."""
+    if not filename:
+        return None
+    patterns = [
+        r"\{(\d+)\}",
+        r"\((\d+)\)",
+        r"\[(\d+)\]",
+        r"[-_](\d+)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, filename)
+        if m:
+            try:
+                val = int(m.group(1))
+                if 0 < val < 10000000:
+                    return val
+            except ValueError:
+                continue
+    return None
 
 
 from contextlib import asynccontextmanager
@@ -98,25 +122,61 @@ def create_app(
         title = meta.title if meta else None
         authors = meta.authors if meta else None
 
-        # Check for {id} in filename
+        # 1. Check for ID in filename ({id}, (id), [id], etc.)
         calibre_id = None
         if filename:
             match = re.search(r"\{(\d+)\}", filename)
             if match:
                 calibre_id = int(match.group(1))
+            else:
+                cand = extract_calibre_id_from_filename(filename)
+                if cand and synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
+                    if synchronizer.calibre.get_book_by_id(cand):
+                        calibre_id = cand
 
-        # If not in filename, check if document is an already known alias
+        # 2. Check if document is an already known alias in internal DB
         if not calibre_id:
             calibre_id = db.get_calibre_id_for_document(payload.document)
 
-        # If calibre_id found, link the document hash as an alias (for compressed files)
+        # 3. Check if document is a known KOReader / MD5 hash in Calibre DB
+        if not calibre_id and synchronizer.calibre and hasattr(synchronizer.calibre, "find_book_by_hash"):
+            calibre_id = synchronizer.calibre.find_book_by_hash(payload.document)
+
+        # 4. Check if document matches MD5 of any Calibre book candidate filename
+        if not calibre_id and synchronizer.calibre and hasattr(synchronizer.calibre, "find_book_by_filename_hash"):
+            calibre_id = synchronizer.calibre.find_book_by_filename_hash(payload.document)
+
+        # 5. Check if filename itself matches filename hash in Calibre DB
+        if not calibre_id and filename and synchronizer.calibre and hasattr(synchronizer.calibre, "find_book_by_filename_hash"):
+            calibre_id = synchronizer.calibre.find_book_by_filename_hash(compute_filename_md5(filename))
+
+        # 6. Fallback to title/author/filename matching in Calibre DB
+        if not calibre_id and synchronizer.calibre and hasattr(synchronizer.calibre, "match_book") and (filename or title):
+            calibre_id = synchronizer.calibre.match_book(
+                document_hash=payload.document,
+                filename=filename,
+                title=title,
+                authors=authors,
+            )
+
+        # If calibre_id found, link the document hash as an alias and resolve canonical details
+        canonical_hash = None
         if calibre_id:
             db.link_document_alias(payload.document, calibre_id, payload.device)
-            if (not title or title == "Unknown" or not authors) and synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
+            if synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
                 cal_b = synchronizer.calibre.get_book_by_id(calibre_id)
                 if cal_b:
                     title = title or cal_b.title
                     authors = authors or cal_b.authors
+                    if not filename and cal_b.file_path:
+                        filename = Path(cal_b.file_path).name
+                    if cal_b.koreader_hash:
+                        canonical_hash = cal_b.koreader_hash
+
+            if not canonical_hash and db and hasattr(db, "get_mapping_by_calibre_id"):
+                m = db.get_mapping_by_calibre_id(calibre_id)
+                if m and m.get("koreader_hash"):
+                    canonical_hash = m["koreader_hash"]
 
         record = ProgressRecord(
             document=payload.document,
@@ -145,7 +205,9 @@ def create_app(
         # Concurrent fanout to both Kavita and Calibre
         tasks = []
         if synchronizer.kavita:
-            tasks.append(synchronizer.kavita.update_progress(record))
+            # If we know the canonical file hash for Kavita, use it so Kavita does not reject with 400
+            kavita_rec = record.model_copy(update={"document": canonical_hash}) if canonical_hash else record
+            tasks.append(synchronizer.kavita.update_progress(kavita_rec))
         if synchronizer.calibre:
             tasks.append(synchronizer.calibre.update_progress(record))
 
@@ -191,6 +253,13 @@ def create_app(
         record = db.get_document(document)
         if not record:
             calibre_id = db.get_calibre_id_for_document(document)
+            if not calibre_id and synchronizer.calibre and hasattr(synchronizer.calibre, "find_book_by_hash"):
+                calibre_id = synchronizer.calibre.find_book_by_hash(document)
+                if not calibre_id and hasattr(synchronizer.calibre, "find_book_by_filename_hash"):
+                    calibre_id = synchronizer.calibre.find_book_by_filename_hash(document)
+                if calibre_id:
+                    db.link_document_alias(document, calibre_id, "KOReader")
+
             if calibre_id and synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
                 cal_book = synchronizer.calibre.get_book_by_id(calibre_id)
                 if cal_book:

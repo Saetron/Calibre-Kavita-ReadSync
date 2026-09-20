@@ -178,6 +178,7 @@ class InternalDatabase:
                 title=row["title"],
                 authors=row["authors"],
                 filename=row["filename"],
+                calibre_id=row["calibre_book_id"],
             )
 
     def get_all_tracked_documents(self) -> List[sqlite3.Row]:
@@ -341,6 +342,15 @@ class InternalDatabase:
             row = cursor.fetchone()
             if row and row["calibre_book_id"]:
                 return row["calibre_book_id"]
+
+            # Fallback to book_mappings
+            cursor = conn.execute(
+                "SELECT calibre_id FROM book_mappings WHERE koreader_hash = ?",
+                (document,),
+            )
+            row = cursor.fetchone()
+            if row and row["calibre_id"]:
+                return row["calibre_id"]
 
         return None
 

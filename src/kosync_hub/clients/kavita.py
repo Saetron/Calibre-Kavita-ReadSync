@@ -128,9 +128,17 @@ class KavitaClient(BaseSyncClient):
 
     async def update_progress(self, record: ProgressRecord) -> bool:
         """Pushes reading progress to Kavita's KOReader sync endpoint AND Kavita WebUI."""
+        target_doc = record.document
+        if record.calibre_id:
+            # Check internal DB mapping for known Kavita/Calibre koreader_hash
+            if self.db and hasattr(self.db, "get_mapping_by_calibre_id"):
+                cached_map = self.db.get_mapping_by_calibre_id(record.calibre_id)
+                if cached_map and cached_map.get("koreader_hash"):
+                    target_doc = cached_map["koreader_hash"]
+
         url = f"{self.koreader_url}/syncs/progress"
         payload = {
-            "document": record.document,
+            "document": target_doc,
             "progress": record.progress,
             "percentage": record.percentage,
             "device": record.device or "Calibre",
@@ -148,12 +156,12 @@ class KavitaClient(BaseSyncClient):
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 res = await client.put(url, json=payload, headers=self._get_koreader_headers())
                 if res.status_code in (200, 201, 202):
-                    logger.debug(f"Pushed progress to Kavita for {record.document} ({record.percentage})")
+                    logger.debug(f"Pushed progress to Kavita for {target_doc} ({record.percentage})")
                     ko_ok = True
                 else:
                     logger.warning(f"Kavita push progress returned status {res.status_code}: {res.text[:100]}")
         except Exception as e:
-            logger.error(f"Exception pushing progress to Kavita for {record.document}: {e}")
+            logger.error(f"Exception pushing progress to Kavita for {target_doc}: {e}")
 
         # Also update Kavita's WebUI reading progress for this user
         if record.calibre_id:

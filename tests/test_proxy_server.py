@@ -222,3 +222,73 @@ async def test_proxy_server_fanout():
             assert "#56905" in res_dash.text
 
 
+@pytest.mark.asyncio
+async def test_crosspoint_filename_sync():
+    """Verifies CrossPoint sync using CHECKSUM_METHOD.FILENAME (no metadata, MD5 of filename)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        db_path = tmp_path / "internal.db"
+        lib_dir = tmp_path / "calibre"
+        lib_dir.mkdir()
+
+        from tests.test_calibre_db import create_mock_calibre_db
+        from kosync_hub.clients.calibre_db import CalibreDbClient
+        from kosync_hub.hasher import compute_filename_md5
+
+        create_mock_calibre_db(lib_dir)
+        db = InternalDatabase(str(db_path))
+        calibre_client = CalibreDbClient(library_path=str(lib_dir), auto_create_columns=True)
+        await calibre_client.test_connection()
+
+        dummy_kavita = DummyClient("MockKavita")
+        config = AppConfig()
+        sync = Synchronizer(db=db, kavita=dummy_kavita, calibre=calibre_client)
+        app = create_app(config=config, db=db, synchronizer=sync)
+
+        # CrossPoint computes MD5 of filename on device (e.g. "Dune (1).epub")
+        fn_hash = compute_filename_md5("Dune (1).epub")
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # 1. Device syncs reading progress with NO metadata
+            payload = {
+                "document": fn_hash,
+                "progress": "page:150/300",
+                "percentage": 0.50,
+                "device": "CrossPoint",
+                "device_id": "xteink-x3",
+            }
+            res = await client.put("/syncs/progress", json=payload)
+            assert res.status_code == 200
+
+            # 2. Check that Calibre ID was resolved to 1
+            rec = db.get_document(fn_hash)
+            assert rec is not None
+            assert rec.calibre_id == 1
+            assert rec.title == "Dune"
+            assert rec.authors == "Frank Herbert"
+
+            # 3. Verify Calibre DB received the progress
+            cal_b = calibre_client.get_book_by_id(1)
+            assert cal_b is not None
+            assert cal_b.percentage == 0.50
+
+            # 4. Verify Kavita received push with canonical KOReader hash, NOT the filename hash
+            assert len(dummy_kavita.pushed_records) == 1
+            assert dummy_kavita.pushed_records[0].document == "dune_hash_12345"
+            assert dummy_kavita.pushed_records[0].percentage == 0.50
+
+            # 5. CrossPoint queries GET /syncs/progress/<fn_hash> and receives 200 OK
+            get_res = await client.get(f"/syncs/progress/{fn_hash}")
+            assert get_res.status_code == 200
+            assert get_res.json()["percentage"] == 0.50
+            assert get_res.json()["document"] == fn_hash
+
+            # 6. Check audit log event recorded Calibre ID #1
+            events = db.get_recent_events(limit=5)
+            assert len(events) >= 1
+            assert events[0]["calibre_id"] == 1
+            assert "for #1" in events[0]["message"]
+
+
+
