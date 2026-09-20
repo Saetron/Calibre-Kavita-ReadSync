@@ -88,6 +88,7 @@ class CalibreDbClient(BaseSyncClient):
         read_status_column: str = "#read_status",
         last_read_column: str = "#last_read",
         progress_column: str = "#koreader_progress",
+        pages_column: str = "#pages",
         auto_create_columns: bool = True,
         mark_read_threshold: float = 0.98,
         internal_db: Optional[Any] = None,
@@ -98,6 +99,7 @@ class CalibreDbClient(BaseSyncClient):
         self.read_status_label = read_status_column.lstrip("#")
         self.last_read_label = last_read_column.lstrip("#")
         self.progress_label = progress_column.lstrip("#")
+        self.pages_label = (pages_column or "#pages").lstrip("#")
         self.auto_create_columns = auto_create_columns
         self.mark_read_threshold = mark_read_threshold
         self.internal_db = internal_db
@@ -1166,6 +1168,12 @@ class CalibreDbClient(BaseSyncClient):
         read_col = self._resolve_column(self.read_pct_label)
         last_read_col = self._resolve_column(self.last_read_label)
         status_col = self._resolve_column(self.read_status_label)
+        pages_col = (
+            self._resolve_column(self.pages_label)
+            or self._resolve_column("pages")
+            or self._resolve_column("page_count")
+            or self._resolve_column("pages_count")
+        )
 
         completed_books = []
         available_years = set()
@@ -1203,6 +1211,9 @@ class CalibreDbClient(BaseSyncClient):
             if status_col:
                 query_parts.append(f"c_stat.value AS read_status")
                 joins.append(f"LEFT JOIN {status_col[1]} c_stat ON b.id = c_stat.book")
+            if pages_col:
+                query_parts.append(f"c_pages.value AS book_pages")
+                joins.append(f"LEFT JOIN {pages_col[1]} c_pages ON b.id = c_pages.book")
 
             sql = f"{', '.join(query_parts)} FROM books b {' '.join(joins)}"
             cursor = conn.execute(sql)
@@ -1252,6 +1263,13 @@ class CalibreDbClient(BaseSyncClient):
                     except Exception:
                         pass
 
+                book_pages = None
+                if pages_col and "book_pages" in r.keys() and r["book_pages"] is not None:
+                    try:
+                        book_pages = int(float(r["book_pages"]))
+                    except (ValueError, TypeError):
+                        book_pages = None
+
                 if is_completed and book_yr:
                     completed_books.append({
                         "id": bid,
@@ -1262,6 +1280,7 @@ class CalibreDbClient(BaseSyncClient):
                         "month": book_month,
                         "date": date_str,
                         "percentage": 100.0,
+                        "pages": book_pages,
                     })
 
         # 2. Also check internal_db tracked_documents to enrich completed books
@@ -1278,6 +1297,15 @@ class CalibreDbClient(BaseSyncClient):
                             b_id = d["calibre_book_id"]
                             # Check if already present
                             if not any(b["id"] == b_id for b in completed_books if b_id):
+                                b_pages = None
+                                if b_id and pages_col:
+                                    try:
+                                        with self._get_connection() as c_conn:
+                                            p_row = c_conn.execute(f"SELECT value FROM {pages_col[1]} WHERE book = ?", (b_id,)).fetchone()
+                                            if p_row and p_row[0] is not None:
+                                                b_pages = int(float(p_row[0]))
+                                    except Exception:
+                                        pass
                                 completed_books.append({
                                     "id": b_id or d["document"][:8],
                                     "title": d["title"] or "Untitled",
@@ -1287,6 +1315,7 @@ class CalibreDbClient(BaseSyncClient):
                                     "month": dt.strftime("%b"),
                                     "date": dt.strftime("%Y-%m-%d"),
                                     "percentage": round(d_pct * 100, 1),
+                                    "pages": b_pages,
                                 })
             except Exception as e:
                 logger.debug(f"Error enriching from internal_db: {e}")
@@ -1344,8 +1373,18 @@ class CalibreDbClient(BaseSyncClient):
             for k, v in sorted(year_tags.items(), key=lambda item: item[1], reverse=True)[:8]
         ]
 
-        # Estimated pages read (assume 320 pages average per finished book)
-        est_pages = len(year_books) * 320
+        # Pages read: sum actual page counts from Calibre if available, fallback to 320 avg
+        total_pages = 0
+        books_with_actual_pages = 0
+        for b in year_books:
+            pgs = b.get("pages")
+            if pgs and pgs > 0:
+                total_pages += pgs
+                books_with_actual_pages += 1
+            else:
+                total_pages += 320  # Fallback estimate per book without custom page count
+
+        is_exact = (len(year_books) > 0 and books_with_actual_pages == len(year_books))
 
         return {
             "selected_year": selected_year,
@@ -1354,7 +1393,9 @@ class CalibreDbClient(BaseSyncClient):
             "books_completed": len(year_books),
             "total_finished_all_time": total_finished_all_time,
             "in_progress": in_progress_count,
-            "estimated_pages": est_pages,
+            "estimated_pages": total_pages,
+            "is_exact_pages": is_exact,
+            "books_with_page_count": books_with_actual_pages,
             "peak_month": peak_month,
             "monthly_counts": monthly_counts,
             "top_read_authors": top_read_authors,

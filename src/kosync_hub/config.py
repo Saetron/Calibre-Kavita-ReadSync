@@ -28,6 +28,7 @@ class CalibreSettings(BaseModel):
     read_status_column: str = "#read_status"
     last_read_column: str = "#last_read"
     progress_column: str = "#koreader_progress"
+    pages_column: str = "#pages"
     auto_create_columns: bool = True
     mark_read_threshold: float = 0.98
 
@@ -188,6 +189,8 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
         config.calibre.read_pct_column = cal_pct
     if (cal_status := os.getenv("CALIBRE_READ_STATUS_COLUMN")) and _should_apply("calibre", "read_status_column", cal_status, "#read_status"):
         config.calibre.read_status_column = cal_status
+    if (cal_pages := os.getenv("CALIBRE_PAGES_COLUMN")) and _should_apply("calibre", "pages_column", cal_pages, "#pages"):
+        config.calibre.pages_column = cal_pages
 
     # Sync
     if (sync_enabled := os.getenv("SYNC_ENABLED")) and _should_apply("sync", "enabled", sync_enabled, True):

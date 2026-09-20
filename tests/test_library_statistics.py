@@ -203,8 +203,55 @@ async def test_reading_history_analytics(calibre_env):
     assert len(analytics_2026["books"]) == 2
     assert 2026 in analytics_2026["available_years"]
     assert 2025 in analytics_2026["available_years"]
+    # Without #pages column, fallback to 320 avg
+    assert analytics_2026["estimated_pages"] == 2 * 320
+    assert analytics_2026["is_exact_pages"] is False
 
     # Query All-time
     analytics_all = client.get_reading_history_analytics(year="all")
     assert analytics_all["selected_year"] == "all"
     assert analytics_all["books_completed"] == 3
+
+
+@pytest.mark.asyncio
+async def test_reading_history_analytics_with_calibre_pages_column(calibre_env):
+    """Verify that when Calibre has a #pages custom column, exact page counts are summed."""
+    client, _ = calibre_env
+    client.pages_label = "pages"
+    await client.test_connection()
+
+    pct_col = client._resolve_column(client.read_pct_label)
+    last_read_col = client._resolve_column(client.last_read_label)
+    status_col = client._resolve_column(client.read_status_label)
+
+    # Create #pages custom column in mock Calibre DB
+    with client._get_connection() as conn:
+        conn.execute("""
+            INSERT INTO custom_columns (label, name, datatype, mark_for_delete, editable, display, is_multiple, normalized)
+            VALUES ('pages', 'Pages', 'int', 0, 1, '{}', 0, 0)
+        """)
+        pages_col_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        pages_tbl = f"custom_column_{pages_col_id}"
+        conn.execute(f"CREATE TABLE {pages_tbl} (id INTEGER PRIMARY KEY AUTOINCREMENT, book INTEGER NOT NULL, value INTEGER NOT NULL)")
+
+        # Book 1: 450 pages, read in 2026
+        conn.execute(f"INSERT OR REPLACE INTO {pct_col[1]} (book, value) VALUES (1, 100.0)")
+        conn.execute(f"INSERT OR REPLACE INTO {status_col[1]} (book, value) VALUES (1, 1)")
+        conn.execute(f"INSERT OR REPLACE INTO {last_read_col[1]} (book, value) VALUES (1, '2026-04-10 12:00:00')")
+        conn.execute(f"INSERT INTO {pages_tbl} (book, value) VALUES (1, 450)")
+
+        # Book 2: 700 pages, read in 2026
+        conn.execute(f"INSERT OR REPLACE INTO {pct_col[1]} (book, value) VALUES (2, 100.0)")
+        conn.execute(f"INSERT OR REPLACE INTO {status_col[1]} (book, value) VALUES (2, 1)")
+        conn.execute(f"INSERT OR REPLACE INTO {last_read_col[1]} (book, value) VALUES (2, '2026-05-15 15:00:00')")
+        conn.execute(f"INSERT INTO {pages_tbl} (book, value) VALUES (2, 700)")
+
+        conn.commit()
+
+    analytics = client.get_reading_history_analytics(year=2026)
+    assert analytics["books_completed"] == 2
+    # 450 + 700 = 1150 pages
+    assert analytics["estimated_pages"] == 1150
+    assert analytics["is_exact_pages"] is True
+    assert analytics["books_with_page_count"] == 2
+

@@ -53,6 +53,7 @@ def init_components(config: AppConfig):
             read_status_column=config.calibre.read_status_column,
             last_read_column=config.calibre.last_read_column,
             progress_column=config.calibre.progress_column,
+            pages_column=config.calibre.pages_column,
             auto_create_columns=config.calibre.auto_create_columns,
             mark_read_threshold=config.calibre.mark_read_threshold,
             internal_db=db,

@@ -258,6 +258,16 @@ async function loadReadingYearStats(year) {
 
         document.getElementById('stats-books-completed').innerText = data.books_completed || 0;
         document.getElementById('stats-pages-read').innerText = (data.estimated_pages || 0).toLocaleString();
+        const descElem = document.getElementById('stats-pages-desc');
+        if (descElem) {
+            if (data.is_exact_pages) {
+                descElem.innerText = 'From Calibre page counts';
+            } else if (data.books_with_page_count > 0) {
+                descElem.innerText = `${data.books_with_page_count}/${data.books_completed} from Calibre (#pages)`;
+            } else {
+                descElem.innerText = 'Estimated (~320 pgs/book)';
+            }
+        }
         const topA = (data.top_read_authors && data.top_read_authors.length > 0) ? data.top_read_authors[0].name : 'None';
         document.getElementById('stats-top-author').innerText = topA;
         document.getElementById('stats-top-author').title = topA;

@@ -124,7 +124,8 @@ def render_stats_tab(
                 </div>
                 <div class="stat-card">
                     <div class="stat-value" id="stats-pages-read" style="color: var(--primary);">-</div>
-                    <div class="stat-label">📄 Est. Pages Read</div>
+                    <div class="stat-label" id="stats-pages-label">📄 Pages Read</div>
+                    <div class="stat-desc" id="stats-pages-desc" style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem;">Estimated (~320 pgs/book)</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-value" id="stats-top-author" style="color: #c084fc; font-size: 1.3rem; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">-</div>
