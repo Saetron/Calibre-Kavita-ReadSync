@@ -30,12 +30,18 @@ def render_dashboard_html(
     db: Any = None,
 ) -> str:
     """Assembles the complete HTML document for the multi-tab web dashboard."""
-    active_tab = tab or "sync"
+    active_tab = tab or "stats"
 
     sync_badge_cls = "badge-success" if config.sync.enabled else "badge-info"
     sync_badge_text = "ON" if config.sync.enabled else "OFF"
     vfs_badge_cls = "badge-success" if config.vfs.enabled else "badge-info"
     vfs_badge_text = config.vfs.mode.upper() if config.vfs.enabled else "OFF"
+
+    stats_tab_html = render_stats_tab(
+        lib_stats=lib_stats,
+        db_counts=db_counts,
+        is_active=(active_tab == "stats"),
+    )
 
     sync_tab_html = render_sync_tab(
         base_url=base_url,
@@ -56,12 +62,6 @@ def render_dashboard_html(
         config=config,
         vfs_summary=vfs_summary,
         is_active=(active_tab == "vfs"),
-    )
-
-    stats_tab_html = render_stats_tab(
-        lib_stats=lib_stats,
-        db_counts=db_counts,
-        is_active=(active_tab == "stats"),
     )
 
     settings_tab_html = render_settings_tab(
@@ -93,18 +93,18 @@ def render_dashboard_html(
             </div>
         </header>
 
-        <!-- Navigation Tabs -->
+        <!-- Navigation Tabs (Statistics is the home page) -->
         <div class="tabs-nav">
+            <button id="tab-btn-stats" class="tab-btn {'active' if active_tab == 'stats' else ''}" onclick="switchTab('stats')">📊 Statistics</button>
             <button id="tab-btn-sync" class="tab-btn {'active' if active_tab == 'sync' else ''}" onclick="switchTab('sync')">📱 Reading Sync</button>
             <button id="tab-btn-vfs" class="tab-btn {'active' if active_tab == 'vfs' else ''}" onclick="switchTab('vfs')">🗂️ Kavita VFS</button>
-            <button id="tab-btn-stats" class="tab-btn {'active' if active_tab == 'stats' else ''}" onclick="switchTab('stats')">📊 Statistics</button>
             <button id="tab-btn-settings" class="tab-btn {'active' if active_tab == 'settings' else ''}" onclick="switchTab('settings')">⚙️ Settings</button>
         </div>
 
+        {stats_tab_html}
         {sync_tab_html}
         {vfs_tab_html}
         {settings_tab_html}
-        {stats_tab_html}
     </div>
 
     <!-- Scripts -->

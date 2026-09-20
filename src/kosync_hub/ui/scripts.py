@@ -25,6 +25,8 @@ window.addEventListener('DOMContentLoaded', () => {
     const hash = window.location.hash.replace('#', '');
     if (hash && ['sync', 'vfs', 'stats', 'settings'].includes(hash)) {
         switchTab(hash);
+    } else {
+        switchTab('stats');
     }
 });
 
@@ -355,6 +357,46 @@ async function runDbCleanup(btn) {
     } finally {
         btn.disabled = false;
         btn.innerText = '🧹 Run Database Cleanup & Vacuum';
+    }
+}
+
+function toggleTopStatsFilter(mode) {
+    const isRead = (mode === 'read');
+    const aAll = document.getElementById('top-authors-all');
+    const aRead = document.getElementById('top-authors-read');
+    const sAll = document.getElementById('top-series-all');
+    const sRead = document.getElementById('top-series-read');
+    const pAll = document.getElementById('top-publishers-all');
+    const pRead = document.getElementById('top-publishers-read');
+
+    if (aAll && aRead) {
+        aAll.style.display = isRead ? 'none' : '';
+        aRead.style.display = isRead ? '' : 'none';
+    }
+    if (sAll && sRead) {
+        sAll.style.display = isRead ? 'none' : '';
+        sRead.style.display = isRead ? '' : 'none';
+    }
+    if (pAll && pRead) {
+        pAll.style.display = isRead ? 'none' : '';
+        pRead.style.display = isRead ? '' : 'none';
+    }
+
+    const lblFilter = isRead ? '(Read Only)' : '(All Books)';
+    if (document.getElementById('lbl-authors-filter')) document.getElementById('lbl-authors-filter').innerText = lblFilter;
+    if (document.getElementById('lbl-series-filter')) document.getElementById('lbl-series-filter').innerText = lblFilter;
+    if (document.getElementById('lbl-pub-filter')) document.getElementById('lbl-pub-filter').innerText = lblFilter;
+
+    const btnAll = document.getElementById('btn-top-all');
+    const btnRead = document.getElementById('btn-top-read');
+    if (btnAll && btnRead) {
+        if (isRead) {
+            btnRead.className = 'btn btn-primary';
+            btnAll.className = 'btn btn-secondary';
+        } else {
+            btnAll.className = 'btn btn-primary';
+            btnRead.className = 'btn btn-secondary';
+        }
     }
 }
 """

@@ -72,6 +72,19 @@ def create_rich_mock_calibre_db(library_dir: Path) -> Path:
     conn.execute("INSERT INTO books_tags_link (book, tag) VALUES (2, 1)")
     conn.execute("INSERT INTO books_tags_link (book, tag) VALUES (3, 2)")
 
+    # Publishers
+    conn.execute("INSERT INTO publishers (id, name) VALUES (1, 'Tor Books')")
+    conn.execute("INSERT INTO publishers (id, name) VALUES (2, 'Orbit')")
+    conn.execute("INSERT INTO books_publishers_link (book, publisher) VALUES (1, 1)")
+    conn.execute("INSERT INTO books_publishers_link (book, publisher) VALUES (2, 1)")
+    conn.execute("INSERT INTO books_publishers_link (book, publisher) VALUES (3, 2)")
+
+    # Languages
+    conn.execute("INSERT INTO languages (id, lang_code) VALUES (1, 'eng')")
+    conn.execute("INSERT INTO books_languages_link (book, lang_code) VALUES (1, 1)")
+    conn.execute("INSERT INTO books_languages_link (book, lang_code) VALUES (2, 1)")
+    conn.execute("INSERT INTO books_languages_link (book, lang_code) VALUES (3, 1)")
+
     # Formats & sizes
     conn.execute("INSERT INTO data (book, format, uncompressed_size, name) VALUES (1, 'EPUB', 2097152, 'Book One')")
     conn.execute("INSERT INTO data (book, format, uncompressed_size, name) VALUES (2, 'EPUB', 3145728, 'Book Two')")
@@ -111,6 +124,8 @@ def test_get_library_statistics(calibre_env):
     assert stats["total_authors"] == 2
     assert stats["total_series"] == 1
     assert stats["total_tags"] == 2
+    assert stats["total_publishers"] == 2
+    assert stats["total_languages"] == 1
     assert stats["total_size_bytes"] > 0
     assert "total_size_gb" in stats
 
@@ -124,10 +139,25 @@ def test_get_library_statistics(calibre_env):
     assert stats["top_series"][0]["name"] == "The Stormlight Archive"
     assert stats["top_series"][0]["count"] == 2
 
+    # Top publishers
+    assert len(stats["top_publishers"]) == 2
+    assert stats["top_publishers"][0]["name"] == "Tor Books"
+    assert stats["top_publishers"][0]["count"] == 2
+
+    # Languages
+    assert len(stats["languages"]) == 1
+    assert stats["languages"][0]["code"] == "eng"
+    assert stats["languages"][0]["count"] == 3
+
     # Formats
     format_names = [f["format"] for f in stats["formats"]]
     assert "EPUB" in format_names
     assert "KEPUB" in format_names
+
+    # Read-only lists exist
+    assert "top_authors_read" in stats
+    assert "top_series_read" in stats
+    assert "top_publishers_read" in stats
 
 
 @pytest.mark.asyncio

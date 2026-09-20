@@ -968,39 +968,90 @@ class CalibreDbClient(BaseSyncClient):
             except Exception as e:
                 logger.debug(f"Error fetching formats: {e}")
 
-            # Top 10 Authors
-            top_authors = []
+            # Identify completed book IDs from Calibre custom columns and internal_db
+            completed_book_ids = set()
+            read_col = self._resolve_column(self.read_pct_label)
+            status_col = self._resolve_column(self.read_status_label)
+
+            if status_col:
+                try:
+                    cur = conn.execute(f"SELECT book FROM {status_col[1]} WHERE value = 1")
+                    for r in cur.fetchall():
+                        completed_book_ids.add(r[0])
+                except Exception as e:
+                    logger.debug(f"Error fetching read_status books: {e}")
+
+            if read_col:
+                try:
+                    cur = conn.execute(f"SELECT book, value FROM {read_col[1]} WHERE value IS NOT NULL")
+                    for r in cur.fetchall():
+                        try:
+                            val = float(r[1])
+                            pct = val / 100.0 if val > 1.0 else val
+                            if pct >= self.mark_read_threshold:
+                                completed_book_ids.add(r[0])
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.debug(f"Error fetching read_pct books: {e}")
+
+            if self.internal_db:
+                try:
+                    with self.internal_db._get_connection() as ic:
+                        cur = ic.execute(
+                            "SELECT calibre_book_id FROM tracked_documents WHERE percentage >= ? AND calibre_book_id IS NOT NULL",
+                            (self.mark_read_threshold,)
+                        )
+                        for r in cur.fetchall():
+                            completed_book_ids.add(r[0])
+                except Exception as e:
+                    logger.debug(f"Error fetching internal_db completed books: {e}")
+
+            # Top 10 Authors (All and Read Only)
+            author_counts_all: Dict[str, int] = {}
+            author_counts_read: Dict[str, int] = {}
             try:
                 cur = conn.execute(
                     """
-                    SELECT a.name, COUNT(bal.book) AS book_count
+                    SELECT a.name, bal.book
                     FROM books_authors_link bal
                     JOIN authors a ON bal.author = a.id
-                    GROUP BY a.id
-                    ORDER BY book_count DESC
-                    LIMIT 10
                     """
                 )
-                top_authors = [{"name": r["name"], "count": r["book_count"]} for r in cur.fetchall()]
+                for r in cur.fetchall():
+                    name = r["name"]
+                    bid = r["book"]
+                    author_counts_all[name] = author_counts_all.get(name, 0) + 1
+                    if bid in completed_book_ids:
+                        author_counts_read[name] = author_counts_read.get(name, 0) + 1
             except Exception as e:
                 logger.debug(f"Error fetching top authors: {e}")
 
-            # Top 10 Series
-            top_series = []
+            top_authors = [{"name": k, "count": v} for k, v in sorted(author_counts_all.items(), key=lambda x: x[1], reverse=True)[:10]]
+            top_authors_read = [{"name": k, "count": v} for k, v in sorted(author_counts_read.items(), key=lambda x: x[1], reverse=True)[:10]]
+
+            # Top 10 Series (All and Read Only)
+            series_counts_all: Dict[str, int] = {}
+            series_counts_read: Dict[str, int] = {}
             try:
                 cur = conn.execute(
                     """
-                    SELECT s.name, COUNT(bsl.book) AS book_count
+                    SELECT s.name, bsl.book
                     FROM books_series_link bsl
                     JOIN series s ON bsl.series = s.id
-                    GROUP BY s.id
-                    ORDER BY book_count DESC
-                    LIMIT 10
                     """
                 )
-                top_series = [{"name": r["name"], "count": r["book_count"]} for r in cur.fetchall()]
+                for r in cur.fetchall():
+                    name = r["name"]
+                    bid = r["book"]
+                    series_counts_all[name] = series_counts_all.get(name, 0) + 1
+                    if bid in completed_book_ids:
+                        series_counts_read[name] = series_counts_read.get(name, 0) + 1
             except Exception as e:
                 logger.debug(f"Error fetching top series: {e}")
+
+            top_series = [{"name": k, "count": v} for k, v in sorted(series_counts_all.items(), key=lambda x: x[1], reverse=True)[:10]]
+            top_series_read = [{"name": k, "count": v} for k, v in sorted(series_counts_read.items(), key=lambda x: x[1], reverse=True)[:10]]
 
             # Top 15 Tags / Genres
             top_tags = []
@@ -1018,6 +1069,46 @@ class CalibreDbClient(BaseSyncClient):
                 top_tags = [{"name": r["name"], "count": r["book_count"]} for r in cur.fetchall()]
             except Exception as e:
                 logger.debug(f"Error fetching top tags: {e}")
+
+            # Top 10 Publishers (All and Read Only)
+            pub_counts_all: Dict[str, int] = {}
+            pub_counts_read: Dict[str, int] = {}
+            try:
+                cur = conn.execute(
+                    """
+                    SELECT p.name, bpl.book
+                    FROM books_publishers_link bpl
+                    JOIN publishers p ON bpl.publisher = p.id
+                    """
+                )
+                for r in cur.fetchall():
+                    name = r["name"]
+                    bid = r["book"]
+                    pub_counts_all[name] = pub_counts_all.get(name, 0) + 1
+                    if bid in completed_book_ids:
+                        pub_counts_read[name] = pub_counts_read.get(name, 0) + 1
+            except Exception as e:
+                logger.debug(f"Error fetching top publishers: {e}")
+
+            top_publishers = [{"name": k, "count": v} for k, v in sorted(pub_counts_all.items(), key=lambda x: x[1], reverse=True)[:10]]
+            top_publishers_read = [{"name": k, "count": v} for k, v in sorted(pub_counts_read.items(), key=lambda x: x[1], reverse=True)[:10]]
+
+            # Languages distribution
+            languages = []
+            try:
+                cur = conn.execute(
+                    """
+                    SELECT l.lang_code, COUNT(bll.book) AS book_count
+                    FROM books_languages_link bll
+                    JOIN languages l ON bll.lang_code = l.id
+                    GROUP BY l.id
+                    ORDER BY book_count DESC
+                    LIMIT 15
+                    """
+                )
+                languages = [{"code": r["lang_code"], "count": r["book_count"]} for r in cur.fetchall()]
+            except Exception as e:
+                logger.debug(f"Error fetching languages: {e}")
 
             # Publication Years Distribution (recent 15 years with books)
             pub_years = []
@@ -1043,12 +1134,18 @@ class CalibreDbClient(BaseSyncClient):
                 "total_tags": total_tags,
                 "total_publishers": total_publishers,
                 "total_languages": total_languages,
+                "completed_books_count": len(completed_book_ids),
                 "total_size_bytes": total_size,
                 "total_size_gb": round(total_size / (1024 * 1024 * 1024), 2) if total_size else 0.0,
                 "formats": formats,
                 "top_authors": top_authors,
+                "top_authors_read": top_authors_read,
                 "top_series": top_series,
+                "top_series_read": top_series_read,
+                "top_publishers": top_publishers,
+                "top_publishers_read": top_publishers_read,
                 "top_tags": top_tags,
+                "languages": languages,
                 "pub_years": pub_years,
             }
 

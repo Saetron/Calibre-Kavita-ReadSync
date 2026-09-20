@@ -17,6 +17,20 @@ def render_formats_badges(formats: List[Dict[str, Any]]) -> str:
     return "".join(items)
 
 
+def render_languages_badges(languages: List[Dict[str, Any]]) -> str:
+    """Renders badges showing language distribution."""
+    if not languages:
+        return "<span style='color:#94a3b8;'>No language data available</span>"
+    items = []
+    for l in languages:
+        items.append(
+            f'<span class="badge badge-info" style="font-size: 0.85rem; padding: 0.4rem 0.8rem;">'
+            f'<strong>{l["code"].upper()}</strong>: {l["count"]:,} books'
+            f'</span>'
+        )
+    return "".join(items)
+
+
 def render_top_authors_table(top_authors: List[Dict[str, Any]]) -> str:
     """Renders top 10 authors table rows."""
     if not top_authors:
@@ -41,6 +55,18 @@ def render_top_series_table(top_series: List[Dict[str, Any]]) -> str:
     return "".join(items)
 
 
+def render_top_publishers_table(top_publishers: List[Dict[str, Any]]) -> str:
+    """Renders top 10 publishers table rows."""
+    if not top_publishers:
+        return "<tr><td colspan='2' style='text-align:center; color:#94a3b8;'>No publisher data</td></tr>"
+    items = []
+    for p in top_publishers:
+        items.append(
+            f'<tr><td><strong>{p["name"]}</strong></td><td style="text-align:right;"><span class="badge badge-primary">{p["count"]}</span></td></tr>'
+        )
+    return "".join(items)
+
+
 def render_top_tags_badges(top_tags: List[Dict[str, Any]]) -> str:
     """Renders popular tags & genres chips."""
     if not top_tags:
@@ -57,15 +83,25 @@ def render_top_tags_badges(top_tags: List[Dict[str, Any]]) -> str:
 def render_stats_tab(
     lib_stats: Dict[str, Any],
     db_counts: Dict[str, Any],
-    is_active: bool = False,
+    is_active: bool = True,
 ) -> str:
-    """Renders Tab 4: Statistics & Year in Review, Calibre Analytics, and Database Maintenance."""
+    """Renders Statistics & Year in Review, Calibre Analytics, and Database Maintenance."""
     active_cls = "active" if is_active else ""
     db_size_mb = round(db_counts.get("file_size_bytes", 0) / (1024 * 1024), 2)
 
     formats_html = render_formats_badges(lib_stats.get("formats", []))
+    languages_html = render_languages_badges(lib_stats.get("languages", []))
+
+    # All books
     top_authors_html = render_top_authors_table(lib_stats.get("top_authors", []))
     top_series_html = render_top_series_table(lib_stats.get("top_series", []))
+    top_publishers_html = render_top_publishers_table(lib_stats.get("top_publishers", []))
+
+    # Read only (completed) books
+    top_authors_read_html = render_top_authors_table(lib_stats.get("top_authors_read", []))
+    top_series_read_html = render_top_series_table(lib_stats.get("top_series_read", []))
+    top_publishers_read_html = render_top_publishers_table(lib_stats.get("top_publishers_read", []))
+
     top_tags_html = render_top_tags_badges(lib_stats.get("top_tags", []))
 
     return f"""<div id="tab-stats" class="tab-content {active_cls}">
@@ -134,8 +170,18 @@ def render_stats_tab(
 
         <!-- Section 2: Calibre Library Analytics -->
         <div class="card" style="border-left: 4px solid var(--primary);">
-            <h2 style="margin: 0 0 0.25rem 0; color: var(--primary); font-size: 1.3rem;">📚 Calibre Library Analytics</h2>
-            <div style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.25rem;">Overview of books, series, tags, and formats from Calibre metadata.db</div>
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem;">
+                <div>
+                    <h2 style="margin: 0; color: var(--primary); font-size: 1.3rem;">📚 Calibre Library Analytics</h2>
+                    <span style="font-size: 0.85rem; color: var(--text-muted);">Overview of books, series, tags, publishers, and formats from Calibre metadata.db</span>
+                </div>
+                <!-- Filter Toggle: All Books vs Read Only -->
+                <div style="display: flex; gap: 6px; align-items: center; background: #0f172a; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--card-border);">
+                    <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600;">Show Top Lists:</span>
+                    <button id="btn-top-all" class="btn btn-primary" style="padding: 3px 10px; font-size: 0.8rem;" onclick="toggleTopStatsFilter('all')">📚 All Books</button>
+                    <button id="btn-top-read" class="btn btn-secondary" style="padding: 3px 10px; font-size: 0.8rem;" onclick="toggleTopStatsFilter('read')">🏆 Read Only (Finished)</button>
+                </div>
+            </div>
 
             <!-- Library KPI Cards -->
             <div class="grid" style="margin-bottom: 1.5rem;">
@@ -156,38 +202,73 @@ def render_stats_tab(
                     <div class="stat-label">🏷️ Tags / Genres</div>
                 </div>
                 <div class="stat-card">
+                    <div class="stat-value">{lib_stats.get('total_publishers', 0):,}</div>
+                    <div class="stat-label">🏢 Publishers</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{lib_stats.get('total_languages', 0):,}</div>
+                    <div class="stat-label">🌐 Languages</div>
+                </div>
+                <div class="stat-card">
                     <div class="stat-value" style="color: var(--success);">{lib_stats.get('total_size_gb', 0)} GB</div>
-                    <div class="stat-label">💾 Library File Storage</div>
+                    <div class="stat-label">💾 Library Storage</div>
                 </div>
             </div>
 
-            <!-- Formats breakdown -->
-            <div style="margin-bottom: 1.5rem;">
-                <div style="font-size: 0.9rem; font-weight: 600; color: var(--text-muted); margin-bottom: 0.5rem;">File Formats Breakdown</div>
-                <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-                    {formats_html}
-                </div>
-            </div>
-
-            <!-- 2-Column Grid for Top Authors & Top Series -->
+            <!-- Formats & Languages breakdown -->
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem; margin-bottom: 1.5rem;">
+                <div>
+                    <div style="font-size: 0.9rem; font-weight: 600; color: var(--text-muted); margin-bottom: 0.5rem;">📁 File Formats Breakdown</div>
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        {formats_html}
+                    </div>
+                </div>
+                <div>
+                    <div style="font-size: 0.9rem; font-weight: 600; color: var(--text-muted); margin-bottom: 0.5rem;">🌐 Languages Breakdown</div>
+                    <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                        {languages_html}
+                    </div>
+                </div>
+            </div>
+
+            <!-- 3-Column Grid for Top Authors, Top Series & Top Publishers with Read Filter -->
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; margin-bottom: 1.5rem;">
                 <!-- Top Authors -->
                 <div style="background: rgba(15, 23, 42, 0.4); padding: 1rem; border-radius: 8px; border: 1px solid var(--card-border);">
-                    <h4 style="margin: 0 0 0.75rem 0; color: var(--primary);">👤 Top 10 Authors</h4>
+                    <h4 style="margin: 0 0 0.75rem 0; color: var(--primary);">👤 Top 10 Authors <span id="lbl-authors-filter" style="font-size: 0.75rem; color: var(--text-muted); font-weight: normal;">(All Books)</span></h4>
                     <table>
                         <thead><tr><th>Author</th><th style="text-align:right;">Books</th></tr></thead>
-                        <tbody>
+                        <tbody id="top-authors-all">
                             {top_authors_html}
+                        </tbody>
+                        <tbody id="top-authors-read" style="display:none;">
+                            {top_authors_read_html}
                         </tbody>
                     </table>
                 </div>
                 <!-- Top Series -->
                 <div style="background: rgba(15, 23, 42, 0.4); padding: 1rem; border-radius: 8px; border: 1px solid var(--card-border);">
-                    <h4 style="margin: 0 0 0.75rem 0; color: var(--primary);">🗂️ Top 10 Series</h4>
+                    <h4 style="margin: 0 0 0.75rem 0; color: var(--primary);">🗂️ Top 10 Series <span id="lbl-series-filter" style="font-size: 0.75rem; color: var(--text-muted); font-weight: normal;">(All Books)</span></h4>
                     <table>
                         <thead><tr><th>Series</th><th style="text-align:right;">Books</th></tr></thead>
-                        <tbody>
+                        <tbody id="top-series-all">
                             {top_series_html}
+                        </tbody>
+                        <tbody id="top-series-read" style="display:none;">
+                            {top_series_read_html}
+                        </tbody>
+                    </table>
+                </div>
+                <!-- Top Publishers -->
+                <div style="background: rgba(15, 23, 42, 0.4); padding: 1rem; border-radius: 8px; border: 1px solid var(--card-border);">
+                    <h4 style="margin: 0 0 0.75rem 0; color: var(--primary);">🏢 Top 10 Publishers <span id="lbl-pub-filter" style="font-size: 0.75rem; color: var(--text-muted); font-weight: normal;">(All Books)</span></h4>
+                    <table>
+                        <thead><tr><th>Publisher</th><th style="text-align:right;">Books</th></tr></thead>
+                        <tbody id="top-publishers-all">
+                            {top_publishers_html}
+                        </tbody>
+                        <tbody id="top-publishers-read" style="display:none;">
+                            {top_publishers_read_html}
                         </tbody>
                     </table>
                 </div>
