@@ -353,6 +353,7 @@ def create_app(
         if synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
             db.repair_missing_titles(
                 synchronizer.calibre.get_book_by_id,
+                getattr(synchronizer.calibre, "find_book_by_hash", None),
                 getattr(synchronizer.calibre, "find_book_by_filename_hash", None),
             )
         return {"status": "completed", "result": res}
@@ -363,6 +364,7 @@ def create_app(
         if synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
             db.repair_missing_titles(
                 synchronizer.calibre.get_book_by_id,
+                getattr(synchronizer.calibre, "find_book_by_hash", None),
                 getattr(synchronizer.calibre, "find_book_by_filename_hash", None),
             )
         db.merge_duplicate_calibre_entries()

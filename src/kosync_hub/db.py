@@ -429,6 +429,36 @@ class InternalDatabase:
         self.link_document_alias(document, calibre_book_id)
         self.merge_duplicate_calibre_entries()
 
+    def get_tracked_document_by_calibre_id(self, calibre_id: int) -> Optional[sqlite3.Row]:
+        """Returns the tracked document row for a given Calibre book ID if it exists."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM tracked_documents WHERE calibre_book_id = ? LIMIT 1",
+                (calibre_id,),
+            )
+            return cursor.fetchone()
+
+    def update_sync_timestamps(
+        self,
+        calibre_id: int,
+        kavita_synced_at: Optional[int] = None,
+        calibre_synced_at: Optional[int] = None,
+        sync_status: Optional[str] = None,
+    ):
+        """Updates remote sync timestamps and status for a Calibre book in tracked_documents."""
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE tracked_documents
+                SET kavita_synced_at = COALESCE(?, kavita_synced_at),
+                    calibre_synced_at = COALESCE(?, calibre_synced_at),
+                    last_sync_status = COALESCE(?, last_sync_status)
+                WHERE calibre_book_id = ?
+                """,
+                (kavita_synced_at, calibre_synced_at, sync_status, calibre_id),
+            )
+            conn.commit()
+
     def get_aliases_for_calibre_id(self, calibre_id: int) -> List[str]:
         """Returns all document hashes linked to a Calibre book ID."""
         with self._get_connection() as conn:
@@ -803,6 +833,7 @@ class InternalDatabase:
         self,
         calibre_get_book_by_id_fn,
         calibre_find_book_by_hash_fn=None,
+        calibre_find_book_by_filename_hash_fn=None,
     ) -> int:
         """
         Repairs any tracked_documents rows where:
@@ -832,6 +863,11 @@ class InternalDatabase:
                 if not cal_id and calibre_find_book_by_hash_fn:
                     try:
                         cal_id = calibre_find_book_by_hash_fn(doc)
+                    except Exception:
+                        pass
+                if not cal_id and calibre_find_book_by_filename_hash_fn:
+                    try:
+                        cal_id = calibre_find_book_by_filename_hash_fn(doc)
                     except Exception:
                         pass
 
