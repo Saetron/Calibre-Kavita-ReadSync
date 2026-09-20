@@ -282,3 +282,66 @@ async def test_calibre_filename_hashes_stored_in_internal_db():
         fresh_client = CalibreDbClient(library_path=str(lib_dir), internal_db=internal_db)
         assert len(fresh_client._filename_hash_cache) == 0
         assert fresh_client.find_book_by_filename_hash("49e2f5c0f6f08f860a5268fa6b518623") == 56134
+
+
+@pytest.mark.asyncio
+async def test_calibre_read_percentage_scale():
+    """Verifies that Calibre #read_pct (0-100 scale) is correctly converted to 0.0-1.0 ratio."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        lib_dir = Path(tmpdir)
+        create_mock_calibre_db(lib_dir)
+
+        client = CalibreDbClient(library_path=str(lib_dir))
+        await client.test_connection()
+
+        conn = sqlite3.connect(str(lib_dir / "metadata.db"))
+        cursor = conn.execute("SELECT label, id FROM custom_columns")
+        cols = {r[0]: r[1] for r in cursor.fetchall()}
+        pct_col_id = cols["read_pct"]
+        status_col_id = cols["read_status"]
+
+        # Test 1: Value 1.0 in Calibre means 1%, NOT 100%!
+        conn.execute(f"INSERT OR REPLACE INTO custom_column_{pct_col_id} (book, value) VALUES (1, 1.0)")
+        conn.execute(f"INSERT OR REPLACE INTO custom_column_{status_col_id} (book, value) VALUES (1, 0)")
+        conn.commit()
+        conn.close()
+
+        book = client.get_book_by_id(1)
+        assert book is not None
+        assert abs(book.percentage - 0.01) < 0.001  # Must be 1% (0.01), not 1.0!
+        assert book.is_read is False
+
+        # Test 2: Value 0.5 in Calibre means 0.5% (0.005)
+        conn = sqlite3.connect(str(lib_dir / "metadata.db"))
+        conn.execute(f"UPDATE custom_column_{pct_col_id} SET value = 0.5 WHERE book = 1")
+        conn.commit()
+        conn.close()
+
+        book = client.get_book_by_id(1)
+        assert book is not None
+        assert abs(book.percentage - 0.005) < 0.0001
+
+        # Test 3: Value 100.0 in Calibre means 100% (1.0)
+        conn = sqlite3.connect(str(lib_dir / "metadata.db"))
+        conn.execute(f"UPDATE custom_column_{pct_col_id} SET value = 100.0 WHERE book = 1")
+        conn.execute(f"UPDATE custom_column_{status_col_id} SET value = 1 WHERE book = 1")
+        conn.commit()
+        conn.close()
+
+        book = client.get_book_by_id(1)
+        assert book is not None
+        assert book.percentage == 1.0
+        assert book.is_read is True
+
+        # Test 4: If user has 100% progress but explicitly unchecked read status (read_status = 0 / False),
+        # book.percentage must be capped below mark_read_threshold (0.98) so it's not marked finished in Kavita
+        conn = sqlite3.connect(str(lib_dir / "metadata.db"))
+        conn.execute(f"UPDATE custom_column_{status_col_id} SET value = 0 WHERE book = 1")
+        conn.commit()
+        conn.close()
+
+        book = client.get_book_by_id(1)
+        assert book is not None
+        assert book.percentage < 0.98
+        assert book.is_read is False
+

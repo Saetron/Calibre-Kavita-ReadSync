@@ -552,15 +552,23 @@ class CalibreDbClient(BaseSyncClient):
                 c_row = conn.execute(f"SELECT value FROM custom_column_{col_id} WHERE book = ?", (book_id,)).fetchone()
                 if c_row and c_row["value"] is not None:
                     val = float(c_row["value"])
-                    pct = val / 100.0 if val > 1.0 else val
+                    pct = max(0.0, min(1.0, val / 100.0))
 
             # Read status
             is_read = False
+            has_read_status_col = False
             if self.read_status_label in self._column_cache:
                 col_id, _ = self._column_cache[self.read_status_label]
                 c_row = conn.execute(f"SELECT value FROM custom_column_{col_id} WHERE book = ?", (book_id,)).fetchone()
                 if c_row and c_row["value"] is not None:
+                    has_read_status_col = True
                     is_read = bool(c_row["value"])
+
+            # If read status column is present and explicitly False, ensure pct cannot be >= 0.98 (or 1.0)
+            if has_read_status_col and not is_read and pct >= 0.98:
+                pct = 0.95
+            elif is_read and pct == 0.0:
+                pct = 1.0
 
             # Last read
             last_read = None
