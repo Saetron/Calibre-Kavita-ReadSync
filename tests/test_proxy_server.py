@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 from pathlib import Path
 import pytest
@@ -66,6 +67,9 @@ async def test_proxy_server_fanout():
             assert res.status_code == 200
             data = res.json()
             assert data["document"] == "doc_hash_xyz"
+
+            # Allow background fanout to execute
+            await asyncio.sleep(0.05)
 
             # Verify fanout to both providers
             assert len(dummy_kavita.pushed_records) == 1
@@ -260,6 +264,7 @@ async def test_crosspoint_filename_sync():
             }
             res = await client.put("/syncs/progress", json=payload)
             assert res.status_code == 200
+            await asyncio.sleep(0.05)
 
             # 2. Check that Calibre ID was resolved to 1
             rec = db.get_document(fn_hash)
@@ -302,6 +307,7 @@ async def test_crosspoint_filename_sync():
             }
             res_dxd = await client.put("/syncs/progress", json=dxd_payload)
             assert res_dxd.status_code == 200
+            await asyncio.sleep(0.05)
 
             # Verify Calibre ID resolved to 56134
             dxd_rec = db.get_document(dxd_hash)
@@ -324,6 +330,122 @@ async def test_crosspoint_filename_sync():
             get_dxd = await client.get(f"/syncs/progress/{dxd_hash}")
             assert get_dxd.status_code == 200
             assert get_dxd.json()["percentage"] == 0.42
+
+
+@pytest.mark.asyncio
+async def test_merge_multiple_hashes_same_calibre_id():
+    """
+    Verifies that when a single Calibre book ID has multiple document hashes
+    (e.g. KOReader binary hash from Calibre backfill AND CrossPoint filename MD5 hash),
+    they are always merged into ONE unified entry in tracked_documents and the Web UI.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        db_path = tmp_path / "internal.db"
+        lib_dir = tmp_path / "calibre"
+        lib_dir.mkdir()
+
+        from tests.test_calibre_db import create_mock_calibre_db
+        from kosync_hub.clients.calibre_db import CalibreDbClient
+
+        create_mock_calibre_db(lib_dir)
+        db = InternalDatabase(str(db_path))
+        calibre_client = CalibreDbClient(library_path=str(lib_dir), auto_create_columns=True)
+        await calibre_client.test_connection()
+
+        dummy_kavita = DummyClient("MockKavita")
+        config = AppConfig()
+        sync = Synchronizer(db=db, kavita=dummy_kavita, calibre=calibre_client)
+        app = create_app(config=config, db=db, synchronizer=sync)
+
+        # 1. Simulate book #56134 having 3.0% read progress in Calibre
+        rec_init = ProgressRecord(
+            document="dxd_canonical_hash_9876",
+            progress="page:30/1000",
+            percentage=0.03,
+            timestamp=1758328000,
+            device="Calibre",
+            title="High School DxD, Vol. 1",
+            authors="Ichiei Ishibumi",
+            calibre_id=56134,
+        )
+        await calibre_client.update_progress(rec_init)
+
+        # Backfill book #56134 into internal DB (canonical hash: "dxd_canonical_hash_9876")
+        await sync.backfill_calibre_books()
+
+        # Check that book #56134 is in tracked_documents with 3.0%
+        all_docs = db.get_all_tracked_documents()
+        dxd_rows = [r for r in all_docs if r["calibre_book_id"] == 56134]
+        assert len(dxd_rows) == 1
+        assert dxd_rows[0]["percentage"] == 0.03
+        canonical_doc = dxd_rows[0]["document"]
+        assert canonical_doc == "dxd_canonical_hash_9876"
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # 2. CrossPoint first opens book with 0.0% (initial open)
+            fn_hash = "49e2f5c0f6f08f860a5268fa6b518623"
+            payload_cp_zero = {
+                "document": fn_hash,
+                "progress": "/6/2[chap1]!/4",
+                "percentage": 0.0,
+                "device": "CrossPoint",
+                "device_id": "xteink-x3",
+            }
+            res_zero = await client.put("/syncs/progress", json=payload_cp_zero)
+            assert res_zero.status_code == 200
+
+            # CRITICAL: tracked_documents must have exactly ONE row for #56134, and 0.0% must NOT wipe out 3.0%!
+            all_docs = db.get_all_tracked_documents()
+            dxd_rows = [r for r in all_docs if r["calibre_book_id"] == 56134]
+            assert len(dxd_rows) == 1, f"Expected 1 merged row, found {len(dxd_rows)}"
+            assert dxd_rows[0]["percentage"] == 0.03
+
+            # 3. CrossPoint now reads forward to 25.0%
+            payload_cp = {
+                "document": fn_hash,
+                "progress": "/6/10[chap3]!/4",
+                "percentage": 0.25,
+                "device": "CrossPoint",
+                "device_id": "xteink-x3",
+            }
+            res = await client.put("/syncs/progress", json=payload_cp)
+            assert res.status_code == 200
+
+            # tracked_documents must STILL have exactly ONE row for #56134, now at 25.0%!
+            all_docs = db.get_all_tracked_documents()
+            dxd_rows = [r for r in all_docs if r["calibre_book_id"] == 56134]
+            assert len(dxd_rows) == 1, f"Expected 1 merged row, found {len(dxd_rows)}"
+            assert dxd_rows[0]["percentage"] == 0.25
+
+            # 4. Both hashes must successfully return the progress via GET
+            # a) Querying with filename hash
+            res_fn = await client.get(f"/syncs/progress/{fn_hash}")
+            assert res_fn.status_code == 200
+            assert res_fn.json()["percentage"] == 0.25
+            assert res_fn.json()["document"] == fn_hash
+
+            # b) Querying with canonical KOReader hash
+            res_canon = await client.get(f"/syncs/progress/{canonical_doc}")
+            assert res_canon.status_code == 200
+            assert res_canon.json()["percentage"] == 0.25
+            assert res_canon.json()["document"] == canonical_doc
+
+            # 5. Check WebUI books API: total books count must reflect 1, not 2
+            books_res = await client.get("/api/books?search=High School DxD")
+            assert books_res.status_code == 200
+            books_data = books_res.json()
+            assert books_data["total"] == 1
+            assert len(books_data["items"]) == 1
+            assert books_data["items"][0]["calibre_book_id"] == 56134
+
+            # 6. Check WebUI dashboard HTML: exactly 1 row for #56134 with +1 badge
+            dash_res = await client.get("/?search=High School DxD")
+            assert dash_res.status_code == 200
+            html = dash_res.text
+            assert html.count('<span class="badge badge-primary">#56134</span>') == 1
+            assert "+1" in html
 
 
 

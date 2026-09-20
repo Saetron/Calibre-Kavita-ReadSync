@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 import unicodedata
 import uuid
 from datetime import datetime
@@ -192,6 +193,7 @@ class CalibreDbClient(BaseSyncClient):
 
     def _load_filename_hashes(self, conn: sqlite3.Connection):
         """Indexes filename MD5s for books in Calibre DB for KOReader/CrossPoint filename sync."""
+        t0 = time.time()
         try:
             try:
                 cursor = conn.execute("""
@@ -219,13 +221,11 @@ class CalibreDbClient(BaseSyncClient):
             for ar in author_cursor.fetchall():
                 book_authors.setdefault(ar["book"], []).append(ar["name"])
 
-            import hashlib
-
             for r in rows:
                 bid = r["id"]
                 title = r["title"] or ""
                 b_path = r["path"] or ""
-                folder_name = b_path.split("/")[-1] if "/" in b_path else b_path
+                folder_name = Path(b_path).name if b_path else ""
                 d_name = r["name"] or ""
                 fmt = (r["format"] or "epub").lower()
                 authors_list = book_authors.get(bid, [])
@@ -234,13 +234,18 @@ class CalibreDbClient(BaseSyncClient):
                 series_index = r["series_index"] if "series_index" in r.keys() else None
 
                 candidates = set()
-                # 1. Exact file in Calibre
+                # 1. Calibre internal filename
                 if d_name:
                     candidates.add(f"{d_name}.{fmt}")
+                    candidates.add(f"{d_name}.{fmt.upper()}")
+                    candidates.add(f"{d_name}.kepub.epub")
+                    candidates.add(d_name)
+                # 2. Folder name (e.g. Title (123))
                 if folder_name:
                     candidates.add(f"{folder_name}.{fmt}")
-
-                # 2. User series template: series/series - series_index {id}
+                    candidates.add(f"{folder_name}.kepub.epub")
+                    candidates.add(folder_name)
+                # 3. Series template variations: series/series - series_index {id}
                 if series_name:
                     s_reprs = []
                     if series_index is not None:
@@ -248,65 +253,93 @@ class CalibreDbClient(BaseSyncClient):
                             s_flt = float(series_index)
                             if s_flt.is_integer():
                                 s_int = int(s_flt)
-                                s_reprs.extend([str(s_int), f"{s_int:02d}"])
+                                s_reprs.extend([str(s_int), f"{s_int:02d}", f"{s_flt:g}", f"{s_flt:.1f}"])
                             else:
-                                s_reprs.append(f"{s_flt:g}")
+                                s_reprs.extend([f"{s_flt:g}", str(s_flt)])
                         except (ValueError, TypeError):
                             s_reprs.append(str(series_index))
                     else:
-                        s_reprs.append("1")
+                        s_reprs.extend(["1", "01"])
 
                     for s_repr in s_reprs:
                         # Exact user template: series - series_index {id}.epub
                         candidates.add(f"{series_name} - {s_repr} {{{bid}}}.{fmt}")
                         candidates.add(f"{series_name} - {s_repr} {{{bid}}}")
+                        candidates.add(f"{series_name} - {s_repr} {{{bid}}}.epub")
                         candidates.add(f"{series_name}/{series_name} - {s_repr} {{{bid}}}.{fmt}")
+                        candidates.add(f"{series_name}/{series_name} - {s_repr} {{{bid}}}")
                         candidates.add(f"{series_name}\\{series_name} - {s_repr} {{{bid}}}.{fmt}")
-                        candidates.add(f"{series_name} - {s_repr} ({bid}).{fmt}")
-                        candidates.add(f"{series_name} - {s_repr}.{fmt}")
-                else:
-                    if title:
-                        candidates.add(f"{title} {{{bid}}}.{fmt}")
-                        candidates.add(f"{title} ({bid}).{fmt}")
-                        candidates.add(f"{title}.{fmt}")
-                    if authors_str and title:
-                        candidates.add(f"{title} - {authors_str}.{fmt}")
+                        candidates.add(f"{series_name}\\{series_name} - {s_repr} {{{bid}}}")
 
+                        # Common variants
+                        candidates.add(f"{series_name} - {s_repr} ({bid}).{fmt}")
+                        candidates.add(f"{series_name} - {s_repr} [{bid}].{fmt}")
+                        candidates.add(f"{series_name} - {s_repr}.{fmt}")
+                        candidates.add(f"{series_name} {s_repr} {{{bid}}}.{fmt}")
+                        candidates.add(f"{series_name} - Volume {s_repr} {{{bid}}}.{fmt}")
+                        candidates.add(f"{series_name} - Vol. {s_repr} {{{bid}}}.{fmt}")
+                        candidates.add(f"{series_name} - Vol {s_repr} {{{bid}}}.{fmt}")
+
+                    if title:
+                        candidates.add(f"{series_name} - {title} {{{bid}}}.{fmt}")
+                        candidates.add(f"{series_name} - {title}.{fmt}")
+
+                # 4. Title variations
+                if title:
+                    candidates.add(f"{title}.{fmt}")
+                    candidates.add(f"{title}.kepub.epub")
+                    candidates.add(title)
+                    candidates.add(f"{title} ({bid}).{fmt}")
+                    candidates.add(f"{title} {{{bid}}}.{fmt}")
+                    candidates.add(f"{title} [{bid}].{fmt}")
+                    candidates.add(f"{title} - {bid}.{fmt}")
+                    candidates.add(f"{title}_{bid}.{fmt}")
+                    candidates.add(f"{bid} - {title}.{fmt}")
+                    candidates.add(f"{bid}_{title}.{fmt}")
+                # 5. Standalone ID patterns
                 candidates.add(f"{bid}.{fmt}")
+                candidates.add(f"{bid}.kepub.epub")
+                # 6. Author + title patterns
+                if authors_str and title:
+                    candidates.add(f"{title} - {authors_str}.{fmt}")
+                    candidates.add(f"{title} - {authors_str} ({bid}).{fmt}")
+                    candidates.add(f"{title} - {authors_str} {{{bid}}}.{fmt}")
+                    candidates.add(f"{title} - {authors_str} [{bid}].{fmt}")
+                    candidates.add(f"{authors_str} - {title}.{fmt}")
+                    candidates.add(f"{authors_str} - {title} ({bid}).{fmt}")
+                    candidates.add(f"{authors_str} - {title} {{{bid}}}.{fmt}")
+                    candidates.add(f"{authors_str} - {title} [{bid}].{fmt}")
 
                 for c in candidates:
                     if c:
                         h = compute_filename_md5(c)
                         self._filename_hash_cache[h] = bid
+                        h_lower = compute_filename_md5(c.lower())
+                        self._filename_hash_cache[h_lower] = bid
                         if "/" in c or "\\" in c:
-                            self._filename_hash_cache[hashlib.md5(c.encode("utf-8")).hexdigest()] = bid
+                            import hashlib
+                            h_full = hashlib.md5(c.encode("utf-8")).hexdigest()
+                            self._filename_hash_cache[h_full] = bid
+                            h_full_lower = hashlib.md5(c.lower().encode("utf-8")).hexdigest()
+                            self._filename_hash_cache[h_full_lower] = bid
 
             self._filename_cache_loaded = True
-            logger.info(f"Indexed {len(self._filename_hash_cache)} filename hashes for Calibre books.")
+            logger.info(
+                f"Indexed {len(self._filename_hash_cache)} candidate filename hashes from Calibre DB in {time.time() - t0:.2f}s"
+            )
         except Exception as e:
             logger.warning(f"Error loading filename hashes from Calibre DB: {e}")
-
-    async def load_filename_hashes_async(self):
-        """Asynchronously pre-loads filename hashes on startup in a worker thread."""
-        if self._filename_cache_loaded:
-            return
-        def _worker():
-            try:
-                with self._get_connection() as conn:
-                    self._load_filename_hashes(conn)
-            except Exception as e:
-                logger.warning(f"Background load of filename hashes failed: {e}")
-        import asyncio
-        await asyncio.to_thread(_worker)
 
     def find_book_by_filename_hash(self, document_hash: str) -> Optional[int]:
         """Looks up a book ID by the MD5 hash of candidate filenames."""
         if not document_hash:
             return None
-        if not self._filename_cache_loaded:
-            with self._get_connection() as conn:
-                self._load_filename_hashes(conn)
-        return self._filename_hash_cache.get(document_hash)
+        if document_hash in self._filename_hash_cache:
+            return self._filename_hash_cache[document_hash]
+
+        with self._get_connection() as conn:
+            self._load_filename_hashes(conn)
+            return self._filename_hash_cache.get(document_hash)
 
     def find_book_by_hash(self, document_hash: str) -> Optional[int]:
         """Looks up a book ID by KOReader or MD5 identifier or filename hash."""

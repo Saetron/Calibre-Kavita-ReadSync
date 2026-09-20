@@ -60,8 +60,6 @@ def create_app(
             asyncio.create_task(synchronizer.kavita.test_connection())
         if synchronizer.calibre:
             asyncio.create_task(synchronizer.calibre.test_connection())
-            if hasattr(synchronizer.calibre, "load_filename_hashes_async"):
-                asyncio.create_task(synchronizer.calibre.load_filename_hashes_async())
 
         # Scan Calibre library if enabled
         if config.sync.scan_on_startup and hasattr(synchronizer.calibre, "scan_and_index_library"):
@@ -91,22 +89,35 @@ def create_app(
     # KOReader Sync Protocol Endpoints (Single-User open auth)
     # -------------------------------------------------------------------------
 
-    async def _handle_auth():
+    async def _handle_auth(user: Optional[str] = None):
         """Single-user KOReader authorization check (accepts any credentials)."""
+        logger.info(f"KOReader auth check received from user='{user or 'anonymous'}'")
         return {"message": "Authorized", "authorized": "OK"}
 
     @app.get("/users/auth", status_code=status.HTTP_200_OK)
+    @app.get("/users/auth/", status_code=status.HTTP_200_OK)
+    @app.post("/users/auth", status_code=status.HTTP_200_OK)
+    @app.post("/users/auth/", status_code=status.HTTP_200_OK)
     @app.get("/koreader/users/auth", status_code=status.HTTP_200_OK)
+    @app.get("/koreader/users/auth/", status_code=status.HTTP_200_OK)
+    @app.post("/koreader/users/auth", status_code=status.HTTP_200_OK)
+    @app.post("/koreader/users/auth/", status_code=status.HTTP_200_OK)
     @app.get("/sync/users/auth", status_code=status.HTTP_200_OK)
+    @app.get("/sync/users/auth/", status_code=status.HTTP_200_OK)
+    @app.post("/sync/users/auth", status_code=status.HTTP_200_OK)
+    @app.post("/sync/users/auth/", status_code=status.HTTP_200_OK)
     async def users_auth(
         x_auth_user: Optional[str] = Header(None),
         x_auth_key: Optional[str] = Header(None),
     ):
-        return await _handle_auth()
+        return await _handle_auth(x_auth_user)
 
     @app.post("/users/create", status_code=status.HTTP_201_CREATED)
+    @app.post("/users/create/", status_code=status.HTTP_201_CREATED)
     @app.post("/koreader/users/create", status_code=status.HTTP_201_CREATED)
+    @app.post("/koreader/users/create/", status_code=status.HTTP_201_CREATED)
     @app.post("/sync/users/create", status_code=status.HTTP_201_CREATED)
+    @app.post("/sync/users/create/", status_code=status.HTTP_201_CREATED)
     async def users_create(payload: UserAuthRequest):
         """KOReader user registration endpoint."""
         logger.info(f"User registration request received for '{payload.username}'")
@@ -123,6 +134,11 @@ def create_app(
         filename = meta.filename if meta else None
         title = meta.title if meta else None
         authors = meta.authors if meta else None
+
+        logger.info(
+            f"Incoming sync update: document={payload.document}, device={payload.device or 'unknown'}, "
+            f"progress={payload.progress}, pct={round(payload.percentage * 100, 1)}%"
+        )
 
         # 1. Check for ID in filename ({id}, (id), [id], etc.)
         calibre_id = None
@@ -204,18 +220,17 @@ def create_app(
                 synced_at=now_ts,
             )
 
-        # Concurrent fanout to both Kavita and Calibre
-        tasks = []
-        if synchronizer.kavita:
-            # If we know the canonical file hash for Kavita, use it so Kavita does not reject with 400
-            kavita_rec = record.model_copy(update={"document": canonical_hash}) if canonical_hash else record
-            tasks.append(synchronizer.kavita.update_progress(kavita_rec))
+        # 1. Update Calibre immediately (fast local SQLite operation, < 2ms)
         if synchronizer.calibre:
-            tasks.append(synchronizer.calibre.update_progress(record))
+            try:
+                await synchronizer.calibre.update_progress(record)
+            except Exception as e:
+                logger.error(f"Error updating Calibre DB for {payload.document}: {e}")
 
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            logger.debug(f"Progress fanout results for {payload.document} (#{calibre_id}): {results}")
+        # 2. Fanout to Kavita in background so reader gets an immediate response without timing out
+        if synchronizer.kavita:
+            kavita_rec = record.model_copy(update={"document": canonical_hash}) if canonical_hash else record
+            asyncio.create_task(synchronizer.kavita.update_progress(kavita_rec))
 
         db.log_sync_event(
             SyncEvent(
@@ -231,6 +246,8 @@ def create_app(
             )
         )
 
+        logger.info(f"Progress recorded successfully for {payload.document} (#{calibre_id or '-'})")
+
         return {
             "document": payload.document,
             "timestamp": now_ts,
@@ -238,9 +255,13 @@ def create_app(
         }
 
     @app.put("/syncs/progress", status_code=status.HTTP_200_OK)
+    @app.put("/syncs/progress/", status_code=status.HTTP_200_OK)
     @app.put("/koreader/syncs/progress", status_code=status.HTTP_200_OK)
+    @app.put("/koreader/syncs/progress/", status_code=status.HTTP_200_OK)
     @app.put("/sync/syncs/progress", status_code=status.HTTP_200_OK)
+    @app.put("/sync/syncs/progress/", status_code=status.HTTP_200_OK)
     @app.put("/sync/progress", status_code=status.HTTP_200_OK)
+    @app.put("/sync/progress/", status_code=status.HTTP_200_OK)
     async def update_progress(payload: ProgressPayload):
         return await _handle_update_progress(payload)
 
@@ -249,6 +270,7 @@ def create_app(
         Retrieves current reading progress for KOReader / CrossPoint.
         Checks local database, alias mapping, and upstreams.
         """
+        logger.info(f"Incoming progress request for document={document}")
         # Trigger single-document sync to reconcile upstreams
         await synchronizer.sync_document(document)
 
@@ -283,9 +305,13 @@ def create_app(
         )
 
     @app.get("/syncs/progress/{document}", response_model=ProgressResponse)
+    @app.get("/syncs/progress/{document}/", response_model=ProgressResponse)
     @app.get("/koreader/syncs/progress/{document}", response_model=ProgressResponse)
+    @app.get("/koreader/syncs/progress/{document}/", response_model=ProgressResponse)
     @app.get("/sync/syncs/progress/{document}", response_model=ProgressResponse)
+    @app.get("/sync/syncs/progress/{document}/", response_model=ProgressResponse)
     @app.get("/sync/progress/{document}", response_model=ProgressResponse)
+    @app.get("/sync/progress/{document}/", response_model=ProgressResponse)
     async def get_progress(document: str):
         return await _handle_get_progress(document)
 
@@ -325,6 +351,7 @@ def create_app(
         count = await synchronizer.backfill_calibre_books()
         if synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
             db.repair_missing_titles(synchronizer.calibre.get_book_by_id)
+        db.merge_duplicate_calibre_entries()
         return {"status": "completed", "backfilled_count": count}
 
     @app.get("/api/books")
@@ -392,11 +419,16 @@ def create_app(
             time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"
             status = d_dict.get("last_sync_status") or "synced"
             device = d_dict.get("device") or "KOReader"
+
+            aliases = db.get_aliases_for_calibre_id(cal_id) if cal_id else []
+            other_aliases = [a for a in aliases if a != doc]
+            alias_badge = f""" <span class="badge badge-info" title="Alternative linked hashes:\n{chr(10).join(other_aliases)}" style="cursor:help; font-size:0.75rem;">+{len(other_aliases)}</span>""" if other_aliases else ""
+
             rows_html_list.append(
                 f"""<tr>
                     <td><strong>{title}</strong><br><small style="color:#94a3b8;">{authors}</small></td>
                     <td><span class="badge badge-primary">#{cal_id if cal_id else '-'}</span></td>
-                    <td><code title="{doc}">{doc[:10]}...</code></td>
+                    <td><code title="{doc}">{doc[:10]}...</code>{alias_badge}</td>
                     <td><span class="badge badge-info">{device}</span></td>
                     <td>
                         <div style="display:flex; align-items:center; gap:8px;">
