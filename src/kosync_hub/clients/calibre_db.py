@@ -9,7 +9,7 @@ import unicodedata
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from ..hasher import compute_all_book_hashes, compute_filename_md5, compute_koreader_partial_md5
 from ..models import CalibreBookRecord, ProgressRecord
@@ -39,6 +39,7 @@ class CalibreDbClient(BaseSyncClient):
         progress_column: str = "#koreader_progress",
         auto_create_columns: bool = True,
         mark_read_threshold: float = 0.98,
+        internal_db: Optional[Any] = None,
     ):
         self.library_path = Path(library_path)
         self.db_path = self.library_path / "metadata.db"
@@ -48,6 +49,7 @@ class CalibreDbClient(BaseSyncClient):
         self.progress_label = progress_column.lstrip("#")
         self.auto_create_columns = auto_create_columns
         self.mark_read_threshold = mark_read_threshold
+        self.internal_db = internal_db
         self._column_cache: Dict[str, Tuple[int, str]] = {}
         self._hash_cache: Dict[str, int] = {}
         self._id_hash_cache: Dict[int, str] = {}
@@ -191,26 +193,66 @@ class CalibreDbClient(BaseSyncClient):
                         return hsh
         return None
 
-    def _load_filename_hashes(self, conn: sqlite3.Connection):
-        """Indexes filename MD5s for books in Calibre DB for KOReader/CrossPoint filename sync."""
+    def index_filename_hashes(
+        self,
+        internal_db: Optional[Any] = None,
+        incremental: bool = True,
+    ) -> int:
+        """
+        Indexes filename MD5s for books in Calibre DB into internal_db or memory cache.
+        If incremental is True and internal_db has indexed previously, only books modified
+        since last_filename_index_time are processed.
+        """
         t0 = time.time()
-        try:
+        db = internal_db or getattr(self, "internal_db", None)
+
+        with self._get_connection() as conn:
+            last_index = None
+            if db and incremental:
+                try:
+                    if hasattr(db, "count_filename_hashes") and db.count_filename_hashes() > 0:
+                        last_index = db.get_metadata("last_filename_index_time")
+                except Exception:
+                    last_index = None
+
+            # Check if last_modified column exists in books table
+            has_last_mod = False
             try:
-                cursor = conn.execute("""
-                    SELECT b.id, b.title, b.path, b.series_index, d.name, d.format, s.name as series_name
+                col_cur = conn.execute("PRAGMA table_info(books)")
+                cols = [c[1] for c in col_cur.fetchall()]
+                has_last_mod = "last_modified" in cols
+            except Exception:
+                pass
+
+            query_where = ""
+            params = []
+            if last_index and has_last_mod:
+                query_where = "WHERE b.last_modified > ?"
+                params.append(last_index)
+
+            last_mod_col = "b.last_modified, " if has_last_mod else ""
+            try:
+                cursor = conn.execute(f"""
+                    SELECT b.id, b.title, b.path, b.series_index, {last_mod_col}d.name, d.format, s.name as series_name
                     FROM books b
                     LEFT JOIN data d ON b.id = d.book
                     LEFT JOIN books_series_link bsl ON b.id = bsl.book
                     LEFT JOIN series s ON bsl.series = s.id
-                """)
+                    {query_where}
+                """, params)
                 rows = cursor.fetchall()
             except sqlite3.OperationalError:
-                cursor = conn.execute("""
-                    SELECT b.id, b.title, b.path, d.name, d.format
+                cursor = conn.execute(f"""
+                    SELECT b.id, b.title, b.path, {last_mod_col}d.name, d.format
                     FROM books b
                     LEFT JOIN data d ON b.id = d.book
-                """)
+                    {query_where}
+                """, params)
                 rows = cursor.fetchall()
+
+            if not rows and last_index:
+                logger.debug("No modified books in Calibre DB since last filename index.")
+                return 0
 
             author_cursor = conn.execute("""
                 SELECT bal.book, a.name
@@ -221,6 +263,8 @@ class CalibreDbClient(BaseSyncClient):
             for ar in author_cursor.fetchall():
                 book_authors.setdefault(ar["book"], []).append(ar["name"])
 
+            batch = []
+            indexed_count = 0
             for r in rows:
                 bid = r["id"]
                 title = r["title"] or ""
@@ -314,32 +358,70 @@ class CalibreDbClient(BaseSyncClient):
                     if c:
                         h = compute_filename_md5(c)
                         self._filename_hash_cache[h] = bid
+                        batch.append((h, bid))
                         h_lower = compute_filename_md5(c.lower())
                         self._filename_hash_cache[h_lower] = bid
+                        batch.append((h_lower, bid))
                         if "/" in c or "\\" in c:
                             import hashlib
                             h_full = hashlib.md5(c.encode("utf-8")).hexdigest()
                             self._filename_hash_cache[h_full] = bid
+                            batch.append((h_full, bid))
                             h_full_lower = hashlib.md5(c.lower().encode("utf-8")).hexdigest()
                             self._filename_hash_cache[h_full_lower] = bid
+                            batch.append((h_full_lower, bid))
+
+                indexed_count += 1
+                if db and hasattr(db, "save_filename_hashes_batch") and len(batch) >= 50000:
+                    db.save_filename_hashes_batch(batch)
+                    batch.clear()
+
+            if db and hasattr(db, "save_filename_hashes_batch") and batch:
+                db.save_filename_hashes_batch(batch)
+                batch.clear()
+
+            if db and hasattr(db, "set_metadata"):
+                import datetime
+                max_mod = max((str(r["last_modified"]) for r in rows if "last_modified" in r.keys() and r["last_modified"]), default=None)
+                db.set_metadata("last_filename_index_time", max_mod or datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
 
             self._filename_cache_loaded = True
+            total_db = db.count_filename_hashes() if db and hasattr(db, "count_filename_hashes") else len(self._filename_hash_cache)
             logger.info(
-                f"Indexed {len(self._filename_hash_cache)} candidate filename hashes from Calibre DB in {time.time() - t0:.2f}s"
+                f"Indexed filename hashes for {indexed_count} books ({total_db} total stored in DB) in {time.time() - t0:.2f}s"
             )
-        except Exception as e:
-            logger.warning(f"Error loading filename hashes from Calibre DB: {e}")
+            return indexed_count
+
+    def _load_filename_hashes(self, conn: sqlite3.Connection):
+        """Backward-compatible loader."""
+        self.index_filename_hashes(getattr(self, "internal_db", None), incremental=False)
 
     def find_book_by_filename_hash(self, document_hash: str) -> Optional[int]:
         """Looks up a book ID by the MD5 hash of candidate filenames."""
         if not document_hash:
             return None
+
+        # 1. Fast indexed lookup from internal DB (< 0.1ms)
+        db = getattr(self, "internal_db", None)
+        if db and hasattr(db, "get_calibre_id_by_filename_hash"):
+            bid = db.get_calibre_id_by_filename_hash(document_hash)
+            if bid:
+                return bid
+
+        # 2. Check in-memory cache
         if document_hash in self._filename_hash_cache:
             return self._filename_hash_cache[document_hash]
 
-        with self._get_connection() as conn:
-            self._load_filename_hashes(conn)
+        # 3. Only if DB/cache is completely uninitialized, run initial index
+        if not self._filename_cache_loaded and (not db or (hasattr(db, "count_filename_hashes") and db.count_filename_hashes() == 0)):
+            self.index_filename_hashes(db, incremental=False)
+            if db and hasattr(db, "get_calibre_id_by_filename_hash"):
+                bid = db.get_calibre_id_by_filename_hash(document_hash)
+                if bid:
+                    return bid
             return self._filename_hash_cache.get(document_hash)
+
+        return None
 
     def find_book_by_hash(self, document_hash: str) -> Optional[int]:
         """Looks up a book ID by KOReader or MD5 identifier or filename hash."""

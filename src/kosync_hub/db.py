@@ -95,6 +95,24 @@ class InternalDatabase:
             except sqlite3.OperationalError:
                 pass
 
+            # Candidate filename hashes cache
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS filename_hashes (
+                    hash TEXT PRIMARY KEY,
+                    calibre_id INTEGER NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_filename_hashes_calibre ON filename_hashes(calibre_id)")
+
+            # Generic key-value metadata store
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS hub_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            """)
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tracked_timestamp ON tracked_documents(timestamp)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_timestamp ON sync_events(timestamp DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_aliases_calibre ON document_aliases(calibre_id)")
@@ -607,10 +625,60 @@ class InternalDatabase:
             )
             conn.commit()
 
-    def get_calibre_id_for_document(self, document: str) -> Optional[int]:
-        """Resolves a document hash to its Calibre ID via document_aliases or tracked_documents."""
+    def get_calibre_id_by_filename_hash(self, document_hash: str) -> Optional[int]:
+        """Fast indexed lookup of Calibre ID by candidate filename MD5 hash."""
+        if not document_hash:
+            return None
         with self._get_connection() as conn:
-            # Check document_aliases first
+            cursor = conn.execute(
+                "SELECT calibre_id FROM filename_hashes WHERE hash = ?",
+                (document_hash,),
+            )
+            row = cursor.fetchone()
+            return row["calibre_id"] if row else None
+
+    def save_filename_hashes_batch(self, pairs: List[tuple[str, int]]):
+        """Batch inserts filename hashes into internal database."""
+        if not pairs:
+            return
+        with self._get_connection() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO filename_hashes (hash, calibre_id) VALUES (?, ?)",
+                pairs,
+            )
+            conn.commit()
+
+    def count_filename_hashes(self) -> int:
+        """Returns total number of stored candidate filename hashes."""
+        with self._get_connection() as conn:
+            return conn.execute("SELECT COUNT(*) FROM filename_hashes").fetchone()[0]
+
+    def get_metadata(self, key: str) -> Optional[str]:
+        """Gets a string value from hub_metadata."""
+        with self._get_connection() as conn:
+            cursor = conn.execute("SELECT value FROM hub_metadata WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            return row["value"] if row else None
+
+    def set_metadata(self, key: str, value: str):
+        """Saves a string value into hub_metadata."""
+        import time
+        now_ts = int(time.time())
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO hub_metadata (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (key, value, now_ts),
+            )
+            conn.commit()
+
+    def get_calibre_id_for_document(self, document: str) -> Optional[int]:
+        """Resolves a document hash to its Calibre ID via document_aliases, filename_hashes, or tracked_documents."""
+        with self._get_connection() as conn:
+            # 1. Check document_aliases first (active device hashes)
             cursor = conn.execute(
                 "SELECT calibre_id FROM document_aliases WHERE document = ?",
                 (document,),
@@ -619,7 +687,16 @@ class InternalDatabase:
             if row and row["calibre_id"]:
                 return row["calibre_id"]
 
-            # Fallback to tracked_documents
+            # 2. Check indexed filename_hashes cache
+            cursor = conn.execute(
+                "SELECT calibre_id FROM filename_hashes WHERE hash = ?",
+                (document,),
+            )
+            row = cursor.fetchone()
+            if row and row["calibre_id"]:
+                return row["calibre_id"]
+
+            # 3. Fallback to tracked_documents
             cursor = conn.execute(
                 "SELECT calibre_book_id FROM tracked_documents WHERE document = ?",
                 (document,),
@@ -628,7 +705,7 @@ class InternalDatabase:
             if row and row["calibre_book_id"]:
                 return row["calibre_book_id"]
 
-            # Fallback to book_mappings
+            # 4. Fallback to book_mappings
             cursor = conn.execute(
                 "SELECT calibre_id FROM book_mappings WHERE koreader_hash = ?",
                 (document,),

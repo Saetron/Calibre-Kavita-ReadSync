@@ -429,13 +429,28 @@ class Synchronizer:
             "error": error_msg,
         }
 
+    async def index_filename_hashes_task(self, force: bool = False):
+        """Indexes filename hashes into internal database incrementally in a worker thread."""
+        if not self.calibre or not hasattr(self.calibre, "index_filename_hashes"):
+            return
+        try:
+            await asyncio.to_thread(self.calibre.index_filename_hashes, self.db, not force)
+        except Exception as e:
+            logger.warning(f"Background filename hash indexing error: {e}")
+
     async def start_background_loop(self):
         """Runs periodic background synchronization."""
         self._is_running = True
         logger.info(f"Background bidirectional sync loop started (interval: {self.interval_seconds}s).")
+        # Initial incremental filename hash indexing in background
+        if self.calibre and hasattr(self.calibre, "index_filename_hashes"):
+            asyncio.create_task(self.index_filename_hashes_task())
+
         while self._is_running:
             try:
                 await self.sync_all()
+                if self.calibre and hasattr(self.calibre, "index_filename_hashes"):
+                    await self.index_filename_hashes_task()
             except Exception as e:
                 logger.error(f"Unexpected error in sync loop: {e}")
             await asyncio.sleep(self.interval_seconds)

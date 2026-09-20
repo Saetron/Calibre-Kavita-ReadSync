@@ -54,6 +54,7 @@ def init_components(config: AppConfig):
             progress_column=config.calibre.progress_column,
             auto_create_columns=config.calibre.auto_create_columns,
             mark_read_threshold=config.calibre.mark_read_threshold,
+            internal_db=db,
         )
 
     sync = Synchronizer(

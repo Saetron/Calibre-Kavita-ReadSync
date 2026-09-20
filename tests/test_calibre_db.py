@@ -245,3 +245,40 @@ async def test_calibre_filename_hash_lookup():
         # 6. Non-existent book returns None
         h_none = compute_filename_md5("Unknown Book 999.epub")
         assert client.find_book_by_filename_hash(h_none) is None
+
+
+@pytest.mark.asyncio
+async def test_calibre_filename_hashes_stored_in_internal_db():
+    """Verifies that filename hashes are persisted to internal.db, enabling instant lookups and incremental updates."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        lib_dir = tmp / "calibre"
+        lib_dir.mkdir()
+        create_mock_calibre_db(lib_dir)
+
+        from kosync_hub.db import InternalDatabase
+        internal_db = InternalDatabase(str(tmp / "internal.db"))
+
+        assert internal_db.count_filename_hashes() == 0
+
+        client = CalibreDbClient(library_path=str(lib_dir), internal_db=internal_db)
+        await client.test_connection()
+
+        # 1. First run indexes and populates internal_db
+        count = client.index_filename_hashes(internal_db, incremental=False)
+        assert count > 0
+        total_stored = internal_db.count_filename_hashes()
+        assert total_stored > 0
+
+        # 2. Lookups directly via internal_db
+        assert internal_db.get_calibre_id_by_filename_hash("49e2f5c0f6f08f860a5268fa6b518623") == 56134
+        assert internal_db.get_calibre_id_for_document("49e2f5c0f6f08f860a5268fa6b518623") == 56134
+
+        # 3. Incremental run should see no new books and return 0
+        inc_count = client.index_filename_hashes(internal_db, incremental=True)
+        assert inc_count == 0
+
+        # 4. A new client instance with completely empty in-memory cache finds hash instantly via internal_db
+        fresh_client = CalibreDbClient(library_path=str(lib_dir), internal_db=internal_db)
+        assert len(fresh_client._filename_hash_cache) == 0
+        assert fresh_client.find_book_by_filename_hash("49e2f5c0f6f08f860a5268fa6b518623") == 56134

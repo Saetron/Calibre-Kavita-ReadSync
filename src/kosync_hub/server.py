@@ -59,6 +59,7 @@ def create_app(
         if synchronizer.kavita:
             asyncio.create_task(synchronizer.kavita.test_connection())
         if synchronizer.calibre:
+            synchronizer.calibre.internal_db = db
             asyncio.create_task(synchronizer.calibre.test_connection())
 
         # Scan Calibre library if enabled
@@ -352,6 +353,7 @@ def create_app(
         if synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
             db.repair_missing_titles(synchronizer.calibre.get_book_by_id)
         db.merge_duplicate_calibre_entries()
+        asyncio.create_task(synchronizer.index_filename_hashes_task(force=False))
         return {"status": "completed", "backfilled_count": count}
 
     @app.get("/api/books")
