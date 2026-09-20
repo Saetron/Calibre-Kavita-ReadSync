@@ -193,12 +193,22 @@ class CalibreDbClient(BaseSyncClient):
     def _load_filename_hashes(self, conn: sqlite3.Connection):
         """Indexes filename MD5s for books in Calibre DB for KOReader/CrossPoint filename sync."""
         try:
-            cursor = conn.execute("""
-                SELECT b.id, b.title, b.path, d.name, d.format
-                FROM books b
-                LEFT JOIN data d ON b.id = d.book
-            """)
-            rows = cursor.fetchall()
+            try:
+                cursor = conn.execute("""
+                    SELECT b.id, b.title, b.path, b.series_index, d.name, d.format, s.name as series_name
+                    FROM books b
+                    LEFT JOIN data d ON b.id = d.book
+                    LEFT JOIN books_series_link bsl ON b.id = bsl.book
+                    LEFT JOIN series s ON bsl.series = s.id
+                """)
+                rows = cursor.fetchall()
+            except sqlite3.OperationalError:
+                cursor = conn.execute("""
+                    SELECT b.id, b.title, b.path, d.name, d.format
+                    FROM books b
+                    LEFT JOIN data d ON b.id = d.book
+                """)
+                rows = cursor.fetchall()
 
             author_cursor = conn.execute("""
                 SELECT bal.book, a.name
@@ -218,6 +228,8 @@ class CalibreDbClient(BaseSyncClient):
                 fmt = (r["format"] or "epub").lower()
                 authors_list = book_authors.get(bid, [])
                 authors_str = ", ".join(authors_list)
+                series_name = r["series_name"] if "series_name" in r.keys() and r["series_name"] else ""
+                series_index = r["series_index"] if "series_index" in r.keys() else None
 
                 candidates = set()
                 # 1. Calibre internal filename
@@ -231,7 +243,46 @@ class CalibreDbClient(BaseSyncClient):
                     candidates.add(f"{folder_name}.{fmt}")
                     candidates.add(f"{folder_name}.kepub.epub")
                     candidates.add(folder_name)
-                # 3. Title variations
+                # 3. Series template variations: series/series - series_index {id}
+                if series_name:
+                    s_reprs = []
+                    if series_index is not None:
+                        try:
+                            s_flt = float(series_index)
+                            if s_flt.is_integer():
+                                s_int = int(s_flt)
+                                s_reprs.extend([str(s_int), f"{s_int:02d}", f"{s_flt:g}", f"{s_flt:.1f}"])
+                            else:
+                                s_reprs.extend([f"{s_flt:g}", str(s_flt)])
+                        except (ValueError, TypeError):
+                            s_reprs.append(str(series_index))
+                    else:
+                        s_reprs.extend(["1", "01"])
+
+                    for s_repr in s_reprs:
+                        # Exact user template: series - series_index {id}.epub
+                        candidates.add(f"{series_name} - {s_repr} {{{bid}}}.{fmt}")
+                        candidates.add(f"{series_name} - {s_repr} {{{bid}}}")
+                        candidates.add(f"{series_name} - {s_repr} {{{bid}}}.epub")
+                        candidates.add(f"{series_name}/{series_name} - {s_repr} {{{bid}}}.{fmt}")
+                        candidates.add(f"{series_name}/{series_name} - {s_repr} {{{bid}}}")
+                        candidates.add(f"{series_name}\\{series_name} - {s_repr} {{{bid}}}.{fmt}")
+                        candidates.add(f"{series_name}\\{series_name} - {s_repr} {{{bid}}}")
+
+                        # Common variants
+                        candidates.add(f"{series_name} - {s_repr} ({bid}).{fmt}")
+                        candidates.add(f"{series_name} - {s_repr} [{bid}].{fmt}")
+                        candidates.add(f"{series_name} - {s_repr}.{fmt}")
+                        candidates.add(f"{series_name} {s_repr} {{{bid}}}.{fmt}")
+                        candidates.add(f"{series_name} - Volume {s_repr} {{{bid}}}.{fmt}")
+                        candidates.add(f"{series_name} - Vol. {s_repr} {{{bid}}}.{fmt}")
+                        candidates.add(f"{series_name} - Vol {s_repr} {{{bid}}}.{fmt}")
+
+                    if title:
+                        candidates.add(f"{series_name} - {title} {{{bid}}}.{fmt}")
+                        candidates.add(f"{series_name} - {title}.{fmt}")
+
+                # 4. Title variations
                 if title:
                     candidates.add(f"{title}.{fmt}")
                     candidates.add(f"{title}.kepub.epub")
@@ -243,10 +294,10 @@ class CalibreDbClient(BaseSyncClient):
                     candidates.add(f"{title}_{bid}.{fmt}")
                     candidates.add(f"{bid} - {title}.{fmt}")
                     candidates.add(f"{bid}_{title}.{fmt}")
-                # 4. Standalone ID patterns
+                # 5. Standalone ID patterns
                 candidates.add(f"{bid}.{fmt}")
                 candidates.add(f"{bid}.kepub.epub")
-                # 5. Author + title patterns
+                # 6. Author + title patterns
                 if authors_str and title:
                     candidates.add(f"{title} - {authors_str}.{fmt}")
                     candidates.add(f"{title} - {authors_str} ({bid}).{fmt}")
@@ -257,7 +308,7 @@ class CalibreDbClient(BaseSyncClient):
                     candidates.add(f"{authors_str} - {title} {{{bid}}}.{fmt}")
                     candidates.add(f"{authors_str} - {title} [{bid}].{fmt}")
 
-                # 6. Physical files on disk if library path accessible
+                # 7. Physical files on disk if library path accessible
                 if b_path and self.library_path:
                     try:
                         book_dir = self.library_path / b_path
@@ -275,6 +326,12 @@ class CalibreDbClient(BaseSyncClient):
                         self._filename_hash_cache[h] = bid
                         h_lower = compute_filename_md5(c.lower())
                         self._filename_hash_cache[h_lower] = bid
+                        if "/" in c or "\\" in c:
+                            import hashlib
+                            h_full = hashlib.md5(c.encode("utf-8")).hexdigest()
+                            self._filename_hash_cache[h_full] = bid
+                            h_full_lower = hashlib.md5(c.lower().encode("utf-8")).hexdigest()
+                            self._filename_hash_cache[h_full_lower] = bid
 
             self._filename_cache_loaded = True
         except Exception as e:

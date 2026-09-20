@@ -290,5 +290,40 @@ async def test_crosspoint_filename_sync():
             assert events[0]["calibre_id"] == 1
             assert "for #1" in events[0]["message"]
 
+            # 7. Test user's exact case: High School DxD/High School DxD - 1 {56134}
+            # The hash CrossPoint produced: 49e2f5c0f6f08f860a5268fa6b518623
+            dxd_hash = "49e2f5c0f6f08f860a5268fa6b518623"
+            dxd_payload = {
+                "document": dxd_hash,
+                "progress": "/6/4[chap1]!/4",
+                "percentage": 0.42,
+                "device": "CrossPoint",
+                "device_id": "xteink-x3",
+            }
+            res_dxd = await client.put("/syncs/progress", json=dxd_payload)
+            assert res_dxd.status_code == 200
+
+            # Verify Calibre ID resolved to 56134
+            dxd_rec = db.get_document(dxd_hash)
+            assert dxd_rec is not None
+            assert dxd_rec.calibre_id == 56134
+            assert dxd_rec.title == "High School DxD, Vol. 1"
+            assert dxd_rec.authors == "Ichiei Ishibumi"
+
+            # Verify Calibre DB received the progress
+            cal_dxd = calibre_client.get_book_by_id(56134)
+            assert cal_dxd is not None
+            assert cal_dxd.percentage == 0.42
+
+            # Verify Kavita received canonical KOReader file hash, NOT 49e2f5c0...
+            assert len(dummy_kavita.pushed_records) == 2
+            assert dummy_kavita.pushed_records[1].document == "dxd_canonical_hash_9876"
+            assert dummy_kavita.pushed_records[1].percentage == 0.42
+
+            # Verify GET /syncs/progress/49e2f5c0... works
+            get_dxd = await client.get(f"/syncs/progress/{dxd_hash}")
+            assert get_dxd.status_code == 200
+            assert get_dxd.json()["percentage"] == 0.42
+
 
 

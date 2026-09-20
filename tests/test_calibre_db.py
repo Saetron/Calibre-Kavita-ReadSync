@@ -16,6 +16,7 @@ def create_mock_calibre_db(library_dir: Path) -> Path:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             path TEXT NOT NULL,
+            series_index REAL DEFAULT 1.0,
             last_modified TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -29,6 +30,18 @@ def create_mock_calibre_db(library_dir: Path) -> Path:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             book INTEGER NOT NULL,
             author INTEGER NOT NULL
+        );
+
+        CREATE TABLE series (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            sort TEXT
+        );
+
+        CREATE TABLE books_series_link (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            book INTEGER NOT NULL,
+            series INTEGER NOT NULL
         );
 
         CREATE TABLE data (
@@ -70,6 +83,15 @@ def create_mock_calibre_db(library_dir: Path) -> Path:
         INSERT INTO authors (id, name) VALUES (2, 'J.R.R. Tolkien');
         INSERT INTO books_authors_link (book, author) VALUES (2, 2);
         INSERT INTO data (book, format, name) VALUES (2, 'EPUB', 'The Hobbit - J.R.R. Tolkien');
+
+        -- Insert sample book 3: High School DxD (series: High School DxD, index: 1.0, id: 56134)
+        INSERT INTO books (id, title, path, series_index) VALUES (56134, 'High School DxD, Vol. 1', 'Ichiei Ishibumi/High School DxD (56134)', 1.0);
+        INSERT INTO authors (id, name) VALUES (3, 'Ichiei Ishibumi');
+        INSERT INTO books_authors_link (book, author) VALUES (56134, 3);
+        INSERT INTO series (id, name) VALUES (10, 'High School DxD');
+        INSERT INTO books_series_link (book, series) VALUES (56134, 10);
+        INSERT INTO data (book, format, name) VALUES (56134, 'EPUB', 'High School DxD Vol 1 - Ichiei Ishibumi');
+        INSERT INTO identifiers (book, type, val) VALUES (56134, 'koreader', 'dxd_canonical_hash_9876');
 
         -- Add Calibre-like triggers that call title_sort and uuid4
         CREATE TRIGGER books_update_trg AFTER UPDATE ON books
@@ -208,6 +230,18 @@ async def test_calibre_filename_hash_lookup():
         h4 = compute_filename_md5("Dune.epub")
         assert client.find_book_by_filename_hash(h4) == 1
 
-        # 5. Non-existent book returns None
+        # 5. Matches user series template: series/series - series_index {id}
+        # Exact hash from user's logs: 49e2f5c0f6f08f860a5268fa6b518623
+        h_dxd = compute_filename_md5("High School DxD - 1 {56134}.epub")
+        assert h_dxd == "49e2f5c0f6f08f860a5268fa6b518623"
+        assert client.find_book_by_filename_hash("49e2f5c0f6f08f860a5268fa6b518623") == 56134
+        assert client.find_book_by_hash("49e2f5c0f6f08f860a5268fa6b518623") == 56134
+
+        # Also matches full path with folder "High School DxD/High School DxD - 1 {56134}.epub"
+        import hashlib
+        h_dxd_full = hashlib.md5("High School DxD/High School DxD - 1 {56134}.epub".encode("utf-8")).hexdigest()
+        assert client.find_book_by_filename_hash(h_dxd_full) == 56134
+
+        # 6. Non-existent book returns None
         h_none = compute_filename_md5("Unknown Book 999.epub")
         assert client.find_book_by_filename_hash(h_none) is None
