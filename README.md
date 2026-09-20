@@ -25,38 +25,36 @@ Both subsystems are **independent options** and can be toggled on or off individ
 ## Architecture
 
 ```
-┌─────────────────┐       (Direct sync via /api/koreader/<apiKey>)
-│ KOReader Device │ ─────────────────────────────────────────────┐
-└─────────────────┘                                              ▼
-┌──────────────────┐     (Sync via /syncs/progress)   ┌─────────────────────┐
-│ CrossPoint (X3)  │ ─────────────────────────────────│    Kavita Server    │
-└──────────────────┘                                  │  - On-Deck / Reads  │
-                                                      │  - KOReader store   │
-                                                      │  - VFS Library dir  │
-                                                      └──────────┬──────────┘
-                                                                 │
-                                              ┌──────────────────┴──────────────────┐
-                                              │                                     │
-                                   Bidirectional Progress Sync              Monitors VFS Dir
-                                   (Matches via Filename {id})             (Reads Hardlinks)
-                                              │                                     │
-                                              ▼                                     │
-                               ┌──────────────────────────────────────────────┐     │
-                               │        kosync-hub (Unified Container)        │     │
-                               │  - Reading Progress Sync (port 8080)         │     │
-                               │  - Kavita VFS Hardlink/Symlink Generator     │ ────┘
-                               │  - Unified 3-Tab WebUI & Settings Editor     │
-                               └──────────────────────┬───────────────────────┘
-                                                      │
-                                           Direct SQLite read/write
-                                           (metadata.db & /vfs output)
-                                                      │
-                                                      ▼
-                                       ┌─────────────────────────────┐
-                                       │     Calibre in Docker       │
-                                       │  - metadata.db (read/write) │
-                                       │  - Book files & formats     │
-                                       └─────────────────────────────┘
+┌─────────────────────────────────┐
+│   CrossPoint (Xteink X3 / X4)   │
+│      or KOReader Devices        │
+└────────────────┬────────────────┘
+                 │
+                 │ Syncs reading progress directly
+                 │ (PUT/GET http://<hub-ip>:8080/syncs/progress)
+                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│               kosync-hub (Unified Container)                │
+│                                                             │
+│   • Central Progress Sync & Translation                     │
+│     - Matches compressed/uncompressed hashes via {id}       │
+│     - Resolves aliases & coordinates star-topology sync     │
+│                                                             │
+│   • Kavita VFS Hardlink/Symlink Generator                   │
+│     - Generates Language/Type/Series/{id} hierarchy         │
+│                                                             │
+│   • WebUI Dashboard & Live Settings Editor (port 8080)      │
+└──────────────┬───────────────────────────────┬──────────────┘
+               │                               │
+    Bidirectional Progress Sync                │ Reads metadata.db
+    (Kavita API / WebUI Reads)                 │ & hardlinks book files
+               │                               │
+               ▼                               ▼
+┌─────────────────────────────┐ ┌─────────────────────────────┐
+│        Kavita Server        │ │      Calibre in Docker      │
+│  - Reads / On-Deck API      │ │  - metadata.db (read/write) │
+│  - Scans VFS library (/vfs) │ │  - Book library storage     │
+└─────────────────────────────┘ └─────────────────────────────┘
 ```
 
 ---
