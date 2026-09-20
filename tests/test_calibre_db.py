@@ -93,6 +93,14 @@ def create_mock_calibre_db(library_dir: Path) -> Path:
         INSERT INTO data (book, format, name) VALUES (56134, 'EPUB', 'High School DxD Vol 1 - Ichiei Ishibumi');
         INSERT INTO identifiers (book, type, val) VALUES (56134, 'koreader', 'dxd_canonical_hash_9876');
 
+        -- Insert sample book 4: 5 Centimeters Per Second + Children Who Chase Lost Voices (id: 55746)
+        INSERT INTO books (id, title, path, series_index) VALUES (55746, '5 Centimeters Per Second + Children Who Chase Lost Voices', 'Makoto Shinkai/5 Centimeters Per Second _ Children (55746)', 1.0);
+        INSERT INTO authors (id, name) VALUES (4, 'Makoto Shinkai');
+        INSERT INTO books_authors_link (book, author) VALUES (55746, 4);
+        INSERT INTO series (id, name) VALUES (11, '5 Centimeters Per Second + Children Who Chase Lost Voices');
+        INSERT INTO books_series_link (book, series) VALUES (55746, 11);
+        INSERT INTO data (book, format, name) VALUES (55746, 'EPUB', '5 Centimeters Per Second _ Children - Makoto Shinkai');
+
         -- Add Calibre-like triggers that call title_sort and uuid4
         CREATE TRIGGER books_update_trg AFTER UPDATE ON books
         BEGIN
@@ -344,4 +352,62 @@ async def test_calibre_read_percentage_scale():
         assert book is not None
         assert book.percentage < 0.98
         assert book.is_read is False
+
+
+@pytest.mark.asyncio
+async def test_calibre_sanitized_plus_filename_hash():
+    """Verifies that filename with sanitized + to _ (b77348322a...) matches Calibre book 55746."""
+    import hashlib
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        lib_dir = tmp / "calibre"
+        lib_dir.mkdir()
+        create_mock_calibre_db(lib_dir)
+
+        from kosync_hub.db import InternalDatabase
+        internal_db = InternalDatabase(str(tmp / "internal.db"))
+
+        client = CalibreDbClient(library_path=str(lib_dir), internal_db=internal_db)
+        await client.test_connection()
+        client.index_filename_hashes(internal_db, incremental=False)
+
+        # The user's exact device filename hash
+        # 5 Centimeters Per Second _ Children Who Chase Lost Voices - 1 {55746}.epub
+        user_fn = "5 Centimeters Per Second _ Children Who Chase Lost Voices - 1 {55746}.epub"
+        user_hash = hashlib.md5(user_fn.encode("utf-8")).hexdigest()
+        assert user_hash.startswith("b77348322a")
+
+        # 1. Look up via internal_db
+        matched_id = internal_db.get_calibre_id_by_filename_hash(user_hash)
+        assert matched_id == 55746
+
+        # 2. Look up via client
+        assert client.find_book_by_filename_hash(user_hash) == 55746
+
+        # 3. Test repairing an unknown tracked document with this hash
+        with internal_db._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO tracked_documents (document, device, percentage, progress, timestamp, calibre_book_id, title)
+                VALUES (?, ?, ?, ?, ?, NULL, 'Unknown')
+                """,
+                (user_hash, "CrossPoint", 0.02, "page:2%", 1726794500),
+            )
+            conn.commit()
+
+        # Before repair
+        unrepaired = internal_db.get_document(user_hash)
+        assert unrepaired.calibre_id is None
+        assert unrepaired.title == "Unknown"
+
+        # Run repair
+        repaired_count = internal_db.repair_missing_titles(client.get_book_by_id, client.find_book_by_filename_hash)
+        assert repaired_count > 0
+
+        # After repair
+        repaired = internal_db.get_document(user_hash)
+        assert repaired.calibre_id == 55746
+        assert "5 Centimeters" in repaired.title
+        assert repaired.authors == "Makoto Shinkai"
+
 

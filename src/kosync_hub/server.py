@@ -70,7 +70,12 @@ def create_app(
         # Repair any missing/unknown titles from Calibre DB
         if synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
             loop = asyncio.get_event_loop()
-            loop.run_in_executor(None, db.repair_missing_titles, synchronizer.calibre.get_book_by_id)
+            loop.run_in_executor(
+                None,
+                db.repair_missing_titles,
+                synchronizer.calibre.get_book_by_id,
+                getattr(synchronizer.calibre, "find_book_by_filename_hash", None),
+            )
 
         # Start background sync worker
         asyncio.create_task(synchronizer.start_background_loop())
@@ -345,16 +350,61 @@ def create_app(
     @app.post("/api/sync-now")
     async def api_sync_now():
         res = await synchronizer.sync_all()
+        if synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
+            db.repair_missing_titles(
+                synchronizer.calibre.get_book_by_id,
+                getattr(synchronizer.calibre, "find_book_by_filename_hash", None),
+            )
         return {"status": "completed", "result": res}
 
     @app.post("/api/backfill")
     async def api_backfill():
         count = await synchronizer.backfill_calibre_books()
         if synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
-            db.repair_missing_titles(synchronizer.calibre.get_book_by_id)
+            db.repair_missing_titles(
+                synchronizer.calibre.get_book_by_id,
+                getattr(synchronizer.calibre, "find_book_by_filename_hash", None),
+            )
         db.merge_duplicate_calibre_entries()
         asyncio.create_task(synchronizer.index_filename_hashes_task(force=False))
         return {"status": "completed", "backfilled_count": count}
+
+    @app.post("/api/link-document")
+    async def api_link_document(payload: dict):
+        """Manually links a document hash to a Calibre ID and updates title/author from Calibre."""
+        doc = payload.get("document")
+        calibre_id = payload.get("calibre_id")
+        if not doc or calibre_id is None:
+            raise HTTPException(status_code=400, detail="Missing document or calibre_id")
+        try:
+            calibre_id = int(calibre_id)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid calibre_id")
+
+        db.link_document_alias(doc, calibre_id)
+        title = None
+        authors = None
+        if synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
+            cal_b = synchronizer.calibre.get_book_by_id(calibre_id)
+            if cal_b:
+                title = cal_b.title
+                authors = cal_b.authors
+
+        with db._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE tracked_documents
+                SET calibre_book_id = ?,
+                    title = COALESCE(?, title),
+                    authors = COALESCE(?, authors)
+                WHERE document = ?
+                """,
+                (calibre_id, title, authors, doc),
+            )
+            conn.commit()
+
+        db.merge_duplicate_calibre_entries()
+        return {"status": "ok", "calibre_id": calibre_id, "title": title}
 
     @app.get("/api/books")
     async def api_books(
@@ -410,6 +460,19 @@ def create_app(
             authors = d_dict.get("authors") or ""
             cal_id = d_dict.get("calibre_book_id")
             doc = str(d_dict.get("document", ""))
+            device = d_dict.get("device") or "KOReader"
+
+            # Auto-resolve missing calibre_id on the fly if hash is known
+            if not cal_id:
+                cal_id = db.get_calibre_id_for_document(doc) or db.get_calibre_id_by_filename_hash(doc)
+                if not cal_id and synchronizer.calibre and hasattr(synchronizer.calibre, "find_book_by_filename_hash"):
+                    cal_id = synchronizer.calibre.find_book_by_filename_hash(doc)
+                if cal_id:
+                    db.link_document_alias(doc, cal_id, device)
+                    with db._get_connection() as c:
+                        c.execute("UPDATE tracked_documents SET calibre_book_id = ? WHERE document = ?", (cal_id, doc))
+                        c.commit()
+
             if (not title or title == "Unknown") and cal_id and synchronizer.calibre and hasattr(synchronizer.calibre, "get_book_by_id"):
                 cal_b = synchronizer.calibre.get_book_by_id(cal_id)
                 if cal_b and cal_b.title:
@@ -420,16 +483,17 @@ def create_app(
             ts = d_dict.get("timestamp", 0)
             time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"
             status = d_dict.get("last_sync_status") or "synced"
-            device = d_dict.get("device") or "KOReader"
 
             aliases = db.get_aliases_for_calibre_id(cal_id) if cal_id else []
             other_aliases = [a for a in aliases if a != doc]
             alias_badge = f""" <span class="badge badge-info" title="Alternative linked hashes:\n{chr(10).join(other_aliases)}" style="cursor:help; font-size:0.75rem;">+{len(other_aliases)}</span>""" if other_aliases else ""
 
+            cal_badge = f"""<span class="badge badge-primary">#{cal_id}</span>""" if cal_id else f"""<button class="btn" style="padding:2px 8px; font-size:0.75rem; background:#f59e0b; color:#fff; border:none; border-radius:4px; cursor:pointer;" onclick="linkDocument('{doc}')" title="Click to manually link to Calibre ID">#- (Link)</button>"""
+
             rows_html_list.append(
                 f"""<tr>
                     <td><strong>{title}</strong><br><small style="color:#94a3b8;">{authors}</small></td>
-                    <td><span class="badge badge-primary">#{cal_id if cal_id else '-'}</span></td>
+                    <td>{cal_badge}</td>
                     <td><code title="{doc}">{doc[:10]}...</code>{alias_badge}</td>
                     <td><span class="badge badge-info">{device}</span></td>
                     <td>
@@ -644,6 +708,31 @@ def create_app(
             </div>
         </div>
     </div>
+    <script>
+    async function linkDocument(doc) {{
+        const idStr = prompt("Enter Calibre Book ID for document " + doc + ":");
+        if (!idStr) return;
+        const calId = parseInt(idStr.trim(), 10);
+        if (isNaN(calId) || calId <= 0) {{
+            alert("Invalid Calibre ID");
+            return;
+        }}
+        try {{
+            const res = await fetch("/api/link-document", {{
+                method: "POST",
+                headers: {{"Content-Type": "application/json"}},
+                body: JSON.stringify({{document: doc, calibre_id: calId}})
+            }});
+            if (res.ok) {{
+                window.location.reload();
+            }} else {{
+                alert("Failed to link document: " + await res.text());
+            }}
+        }} catch (e) {{
+            alert("Error linking document: " + e);
+        }}
+    }}
+    </script>
 </body>
 </html>"""
         return HTMLResponse(content=html)

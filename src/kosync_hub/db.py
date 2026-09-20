@@ -799,13 +799,58 @@ class InternalDatabase:
             )
             conn.commit()
 
-    def repair_missing_titles(self, calibre_get_book_by_id_fn) -> int:
+    def repair_missing_titles(
+        self,
+        calibre_get_book_by_id_fn,
+        calibre_find_book_by_hash_fn=None,
+    ) -> int:
         """
-        Repairs any tracked_documents rows where title is NULL, empty, or 'Unknown'
-        by querying Calibre for the book's title and authors.
+        Repairs any tracked_documents rows where:
+        1. calibre_book_id is NULL: attempts to resolve calibre_id via filename_hashes / aliases
+           or Calibre hash lookup.
+        2. title is NULL, empty, or 'Unknown': queries Calibre for the book's title and authors.
+        3. Merges duplicate entries for the same Calibre ID.
         """
+        import time
+        now_ts = int(time.time())
         repaired = 0
         with self._get_connection() as conn:
+            # 1. Resolve rows with calibre_book_id IS NULL
+            cursor = conn.execute(
+                """
+                SELECT document, device, percentage, progress, timestamp
+                FROM tracked_documents
+                WHERE calibre_book_id IS NULL
+                """
+            )
+            unmatched = [dict(r) for r in cursor.fetchall()]
+            for r in unmatched:
+                doc = r["document"]
+                cal_id = self.get_calibre_id_for_document(doc)
+                if not cal_id:
+                    cal_id = self.get_calibre_id_by_filename_hash(doc)
+                if not cal_id and calibre_find_book_by_hash_fn:
+                    try:
+                        cal_id = calibre_find_book_by_hash_fn(doc)
+                    except Exception:
+                        pass
+
+                if cal_id:
+                    conn.execute(
+                        "UPDATE tracked_documents SET calibre_book_id = ? WHERE document = ?",
+                        (cal_id, doc),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO document_aliases (document, calibre_id, device, created_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(document) DO UPDATE SET calibre_id = excluded.calibre_id
+                        """,
+                        (doc, cal_id, r.get("device"), now_ts),
+                    )
+                    repaired += 1
+
+            # 2. Repair missing or Unknown titles where calibre_book_id is set
             cursor = conn.execute(
                 """
                 SELECT document, calibre_book_id FROM tracked_documents
@@ -832,8 +877,10 @@ class InternalDatabase:
                 except Exception as e:
                     logger.debug(f"Failed to repair title for #{bid}: {e}")
             conn.commit()
+
         if repaired > 0:
-            logger.info(f"Successfully repaired {repaired} missing book titles from Calibre DB.")
+            self.merge_duplicate_calibre_entries()
+            logger.info(f"Successfully repaired {repaired} tracked documents/titles from Calibre DB.")
         return repaired
 
     def get_paginated_documents(

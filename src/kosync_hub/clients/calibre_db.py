@@ -27,6 +27,57 @@ def normalize_string(s: Optional[str]) -> str:
     return re.sub(r"[^\w\s]", "", s.lower()).strip()
 
 
+def get_sanitized_name_variants(text: str) -> List[str]:
+    """
+    Generates filesystem-sanitized variations of a series or title.
+    Calibre and FAT32/e-reader filesystems replace characters like +, &, :, ?, *, ", <, >, |
+    with underscores (_) or spaces when exporting files or saving to devices.
+    """
+    if not text:
+        return []
+    variants = {text}
+
+    # 1. Plus sign (+ -> _, + -> space, + -> &)
+    if "+" in text:
+        variants.add(text.replace("+", "_"))
+        variants.add(text.replace(" + ", " _ "))
+        variants.add(re.sub(r"\s*\+\s*", " _ ", text))
+        variants.add(re.sub(r"\s*\+\s*", " ", text))
+        variants.add(text.replace("+", " "))
+
+    # 2. Ampersand (& -> _, & -> and)
+    if "&" in text:
+        variants.add(text.replace("&", "_"))
+        variants.add(text.replace("&", "and"))
+        variants.add(text.replace(" & ", " _ "))
+
+    # 3. Colon (: -> -, : -> _, : -> space)
+    if ":" in text:
+        variants.add(text.replace(":", " -"))
+        variants.add(text.replace(":", " _"))
+        variants.add(text.replace(":", "_"))
+        variants.add(text.replace(":", " "))
+        variants.add(text.replace(":", ""))
+
+    # 4. Standard FAT/Calibre illegal filename chars: ? * " < > | / \
+    for ch in ['?', '*', '"', '<', '>', '|']:
+        if ch in text:
+            variants.add(text.replace(ch, "_"))
+            variants.add(text.replace(ch, ""))
+
+    # 5. Cleaned variants: collapsed underscores and normalized spaces
+    cleaned = set(variants)
+    for v in list(variants):
+        c1 = re.sub(r"_+", "_", v).strip()
+        c2 = re.sub(r"\s+", " ", v).strip()
+        c3 = re.sub(r"\s*_\s*", " _ ", v).strip()
+        cleaned.add(c1)
+        cleaned.add(c2)
+        cleaned.add(c3)
+
+    return [v for v in cleaned if v]
+
+
 class CalibreDbClient(BaseSyncClient):
     """Interacts directly with a Calibre library's metadata.db and book files."""
 
@@ -211,7 +262,10 @@ class CalibreDbClient(BaseSyncClient):
             if db and incremental:
                 try:
                     if hasattr(db, "count_filename_hashes") and db.count_filename_hashes() > 0:
-                        last_index = db.get_metadata("last_filename_index_time")
+                        if hasattr(db, "get_metadata") and db.get_metadata("filename_index_version") != "2":
+                            last_index = None
+                        else:
+                            last_index = db.get_metadata("last_filename_index_time")
                 except Exception:
                     last_index = None
 
@@ -305,41 +359,48 @@ class CalibreDbClient(BaseSyncClient):
                     else:
                         s_reprs.extend(["1", "01"])
 
-                    for s_repr in s_reprs:
-                        # Exact user template: series - series_index {id}.epub
-                        candidates.add(f"{series_name} - {s_repr} {{{bid}}}.{fmt}")
-                        candidates.add(f"{series_name} - {s_repr} {{{bid}}}")
-                        candidates.add(f"{series_name} - {s_repr} {{{bid}}}.epub")
-                        candidates.add(f"{series_name}/{series_name} - {s_repr} {{{bid}}}.{fmt}")
-                        candidates.add(f"{series_name}/{series_name} - {s_repr} {{{bid}}}")
-                        candidates.add(f"{series_name}\\{series_name} - {s_repr} {{{bid}}}.{fmt}")
-                        candidates.add(f"{series_name}\\{series_name} - {s_repr} {{{bid}}}")
+                    series_variants = get_sanitized_name_variants(series_name)
+                    for s_var in series_variants:
+                        for s_repr in s_reprs:
+                            # Exact user template: series - series_index {id}.epub
+                            candidates.add(f"{s_var} - {s_repr} {{{bid}}}.{fmt}")
+                            candidates.add(f"{s_var} - {s_repr} {{{bid}}}")
+                            candidates.add(f"{s_var} - {s_repr} {{{bid}}}.epub")
+                            candidates.add(f"{s_var}/{s_var} - {s_repr} {{{bid}}}.{fmt}")
+                            candidates.add(f"{s_var}/{s_var} - {s_repr} {{{bid}}}")
+                            candidates.add(f"{s_var}\\{s_var} - {s_repr} {{{bid}}}.{fmt}")
+                            candidates.add(f"{s_var}\\{s_var} - {s_repr} {{{bid}}}")
+                            if s_var != series_name:
+                                candidates.add(f"{series_name}/{s_var} - {s_repr} {{{bid}}}.{fmt}")
+                                candidates.add(f"{s_var}/{series_name} - {s_repr} {{{bid}}}.{fmt}")
 
-                        # Common variants
-                        candidates.add(f"{series_name} - {s_repr} ({bid}).{fmt}")
-                        candidates.add(f"{series_name} - {s_repr} [{bid}].{fmt}")
-                        candidates.add(f"{series_name} - {s_repr}.{fmt}")
-                        candidates.add(f"{series_name} {s_repr} {{{bid}}}.{fmt}")
-                        candidates.add(f"{series_name} - Volume {s_repr} {{{bid}}}.{fmt}")
-                        candidates.add(f"{series_name} - Vol. {s_repr} {{{bid}}}.{fmt}")
-                        candidates.add(f"{series_name} - Vol {s_repr} {{{bid}}}.{fmt}")
+                            # Common variants
+                            candidates.add(f"{s_var} - {s_repr} ({bid}).{fmt}")
+                            candidates.add(f"{s_var} - {s_repr} [{bid}].{fmt}")
+                            candidates.add(f"{s_var} - {s_repr}.{fmt}")
+                            candidates.add(f"{s_var} {s_repr} {{{bid}}}.{fmt}")
+                            candidates.add(f"{s_var} - Volume {s_repr} {{{bid}}}.{fmt}")
+                            candidates.add(f"{s_var} - Vol. {s_repr} {{{bid}}}.{fmt}")
+                            candidates.add(f"{s_var} - Vol {s_repr} {{{bid}}}.{fmt}")
 
-                    if title:
-                        candidates.add(f"{series_name} - {title} {{{bid}}}.{fmt}")
-                        candidates.add(f"{series_name} - {title}.{fmt}")
+                        if title:
+                            candidates.add(f"{s_var} - {title} {{{bid}}}.{fmt}")
+                            candidates.add(f"{s_var} - {title}.{fmt}")
 
                 # 4. Title variations
                 if title:
-                    candidates.add(f"{title}.{fmt}")
-                    candidates.add(f"{title}.kepub.epub")
-                    candidates.add(title)
-                    candidates.add(f"{title} ({bid}).{fmt}")
-                    candidates.add(f"{title} {{{bid}}}.{fmt}")
-                    candidates.add(f"{title} [{bid}].{fmt}")
-                    candidates.add(f"{title} - {bid}.{fmt}")
-                    candidates.add(f"{title}_{bid}.{fmt}")
-                    candidates.add(f"{bid} - {title}.{fmt}")
-                    candidates.add(f"{bid}_{title}.{fmt}")
+                    title_variants = get_sanitized_name_variants(title)
+                    for t_var in title_variants:
+                        candidates.add(f"{t_var}.{fmt}")
+                        candidates.add(f"{t_var}.kepub.epub")
+                        candidates.add(t_var)
+                        candidates.add(f"{t_var} ({bid}).{fmt}")
+                        candidates.add(f"{t_var} {{{bid}}}.{fmt}")
+                        candidates.add(f"{t_var} [{bid}].{fmt}")
+                        candidates.add(f"{t_var} - {bid}.{fmt}")
+                        candidates.add(f"{t_var}_{bid}.{fmt}")
+                        candidates.add(f"{bid} - {t_var}.{fmt}")
+                        candidates.add(f"{bid}_{t_var}.{fmt}")
                 # 5. Standalone ID patterns
                 candidates.add(f"{bid}.{fmt}")
                 candidates.add(f"{bid}.kepub.epub")
@@ -383,6 +444,7 @@ class CalibreDbClient(BaseSyncClient):
             if db and hasattr(db, "set_metadata"):
                 import datetime
                 max_mod = max((str(r["last_modified"]) for r in rows if "last_modified" in r.keys() and r["last_modified"]), default=None)
+                db.set_metadata("filename_index_version", "2")
                 db.set_metadata("last_filename_index_time", max_mod or datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
 
             self._filename_cache_loaded = True

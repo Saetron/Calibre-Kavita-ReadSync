@@ -448,4 +448,55 @@ async def test_merge_multiple_hashes_same_calibre_id():
             assert "+1" in html
 
 
+@pytest.mark.asyncio
+async def test_api_link_document_and_webui():
+    """Tests manually linking an unknown document hash to a Calibre ID via /api/link-document."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test.db"
+        db = InternalDatabase(str(db_path))
+
+        dummy_kavita = DummyClient("MockKavita")
+        dummy_calibre = DummyClient("MockCalibre")
+
+        config = AppConfig()
+        sync = Synchronizer(db=db, kavita=dummy_kavita, calibre=dummy_calibre)
+        app = create_app(config=config, db=db, synchronizer=sync)
+
+        # 1. Add an unknown tracked document
+        unknown_doc = "unknown_doc_hash_112233"
+        with db._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO tracked_documents (document, device, percentage, progress, timestamp, calibre_book_id, title)
+                VALUES (?, ?, ?, ?, ?, NULL, 'Unknown')
+                """,
+                (unknown_doc, "CrossPoint", 0.05, "page:5%", 1726794500),
+            )
+            conn.commit()
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # Check dashboard shows Link button
+            dash_before = await client.get("/")
+            assert dash_before.status_code == 200
+            assert "linkDocument('unknown_doc_hash_112233')" in dash_before.text
+            assert "#- (Link)" in dash_before.text
+
+            # 2. Call /api/link-document
+            link_res = await client.post("/api/link-document", json={"document": unknown_doc, "calibre_id": 9999})
+            assert link_res.status_code == 200
+            assert link_res.json()["status"] == "ok"
+            assert link_res.json()["calibre_id"] == 9999
+
+            # 3. Check document is now linked
+            doc_rec = db.get_document(unknown_doc)
+            assert doc_rec.calibre_id == 9999
+
+            # 4. Check dashboard now shows #9999 badge
+            dash_after = await client.get("/")
+            assert dash_after.status_code == 200
+            assert '<span class="badge badge-primary">#9999</span>' in dash_after.text
+
+
+
 
