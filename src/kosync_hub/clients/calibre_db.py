@@ -1200,6 +1200,15 @@ class CalibreDbClient(BaseSyncClient):
             for tr in tags_cursor.fetchall():
                 book_tags.setdefault(tr["book"], []).append(tr["name"])
 
+            has_native_pages = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='books_pages_link'"
+            ).fetchone() is not None
+
+            has_books_pages = any(
+                col["name"] == "pages"
+                for col in conn.execute("PRAGMA table_info(books)").fetchall()
+            )
+
             query_parts = ["SELECT b.id, b.title"]
             joins = []
             if read_col:
@@ -1212,8 +1221,13 @@ class CalibreDbClient(BaseSyncClient):
                 query_parts.append(f"c_stat.value AS read_status")
                 joins.append(f"LEFT JOIN {status_col[1]} c_stat ON b.id = c_stat.book")
             if pages_col:
-                query_parts.append(f"c_pages.value AS book_pages")
+                query_parts.append(f"c_pages.value AS custom_pages")
                 joins.append(f"LEFT JOIN {pages_col[1]} c_pages ON b.id = c_pages.book")
+            if has_native_pages:
+                query_parts.append("bpl.pages AS native_pages")
+                joins.append("LEFT JOIN books_pages_link bpl ON b.id = bpl.book")
+            elif has_books_pages:
+                query_parts.append("b.pages AS native_pages")
 
             sql = f"{', '.join(query_parts)} FROM books b {' '.join(joins)}"
             cursor = conn.execute(sql)
@@ -1264,11 +1278,23 @@ class CalibreDbClient(BaseSyncClient):
                         pass
 
                 book_pages = None
-                if pages_col and "book_pages" in r.keys() and r["book_pages"] is not None:
+                # 1. Custom column first (#pages, #page_count)
+                if pages_col and "custom_pages" in r.keys() and r["custom_pages"] is not None:
                     try:
-                        book_pages = int(float(r["book_pages"]))
+                        val = int(float(r["custom_pages"]))
+                        if val > 0:
+                            book_pages = val
                     except (ValueError, TypeError):
-                        book_pages = None
+                        pass
+
+                # 2. Calibre 9.0+ inbuilt books_pages_link or books.pages
+                if not book_pages and "native_pages" in r.keys() and r["native_pages"] is not None:
+                    try:
+                        val = int(float(r["native_pages"]))
+                        if val > 0:
+                            book_pages = val
+                    except (ValueError, TypeError):
+                        pass
 
                 if is_completed and book_yr:
                     completed_books.append({
@@ -1298,12 +1324,27 @@ class CalibreDbClient(BaseSyncClient):
                             # Check if already present
                             if not any(b["id"] == b_id for b in completed_books if b_id):
                                 b_pages = None
-                                if b_id and pages_col:
+                                if b_id:
                                     try:
                                         with self._get_connection() as c_conn:
-                                            p_row = c_conn.execute(f"SELECT value FROM {pages_col[1]} WHERE book = ?", (b_id,)).fetchone()
-                                            if p_row and p_row[0] is not None:
-                                                b_pages = int(float(p_row[0]))
+                                            if pages_col:
+                                                p_row = c_conn.execute(f"SELECT value FROM {pages_col[1]} WHERE book = ?", (b_id,)).fetchone()
+                                                if p_row and p_row[0] is not None:
+                                                    val = int(float(p_row[0]))
+                                                    if val > 0:
+                                                        b_pages = val
+                                            if not b_pages and has_native_pages:
+                                                p_row = c_conn.execute("SELECT pages FROM books_pages_link WHERE book = ?", (b_id,)).fetchone()
+                                                if p_row and p_row[0] is not None:
+                                                    val = int(float(p_row[0]))
+                                                    if val > 0:
+                                                        b_pages = val
+                                            elif not b_pages and has_books_pages:
+                                                p_row = c_conn.execute("SELECT pages FROM books WHERE id = ?", (b_id,)).fetchone()
+                                                if p_row and p_row[0] is not None:
+                                                    val = int(float(p_row[0]))
+                                                    if val > 0:
+                                                        b_pages = val
                                     except Exception:
                                         pass
                                 completed_books.append({
@@ -1396,6 +1437,7 @@ class CalibreDbClient(BaseSyncClient):
             "estimated_pages": total_pages,
             "is_exact_pages": is_exact,
             "books_with_page_count": books_with_actual_pages,
+            "has_native_pages": has_native_pages or has_books_pages,
             "peak_month": peak_month,
             "monthly_counts": monthly_counts,
             "top_read_authors": top_read_authors,

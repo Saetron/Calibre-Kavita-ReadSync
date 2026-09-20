@@ -255,3 +255,53 @@ async def test_reading_history_analytics_with_calibre_pages_column(calibre_env):
     assert analytics["is_exact_pages"] is True
     assert analytics["books_with_page_count"] == 2
 
+
+@pytest.mark.asyncio
+async def test_reading_history_analytics_with_calibre_inbuilt_pages_table(calibre_env):
+    """Verify that when Calibre 9.0+ has an inbuilt books_pages_link table and no custom column, native pages are used."""
+    client, _ = calibre_env
+    # No custom pages column
+    client.pages_label = "non_existent_pages_col"
+    await client.test_connection()
+
+    pct_col = client._resolve_column(client.read_pct_label)
+    last_read_col = client._resolve_column(client.last_read_label)
+    status_col = client._resolve_column(client.read_status_label)
+
+    # Create native Calibre 9.0+ books_pages_link table
+    with client._get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS books_pages_link (
+                book INTEGER PRIMARY KEY,
+                pages INTEGER DEFAULT 0 NOT NULL,
+                algorithm INTEGER DEFAULT 0 NOT NULL,
+                format TEXT DEFAULT '' NOT NULL COLLATE NOCASE,
+                format_size INTEGER DEFAULT 0 NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                needs_scan INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+        # Book 1: 385 pages in books_pages_link
+        conn.execute(f"INSERT OR REPLACE INTO {pct_col[1]} (book, value) VALUES (1, 100.0)")
+        conn.execute(f"INSERT OR REPLACE INTO {status_col[1]} (book, value) VALUES (1, 1)")
+        conn.execute(f"INSERT OR REPLACE INTO {last_read_col[1]} (book, value) VALUES (1, '2026-06-10 12:00:00')")
+        conn.execute("INSERT OR REPLACE INTO books_pages_link (book, pages) VALUES (1, 385)")
+
+        # Book 2: 512 pages in books_pages_link
+        conn.execute(f"INSERT OR REPLACE INTO {pct_col[1]} (book, value) VALUES (2, 100.0)")
+        conn.execute(f"INSERT OR REPLACE INTO {status_col[1]} (book, value) VALUES (2, 1)")
+        conn.execute(f"INSERT OR REPLACE INTO {last_read_col[1]} (book, value) VALUES (2, '2026-07-15 15:00:00')")
+        conn.execute("INSERT OR REPLACE INTO books_pages_link (book, pages) VALUES (2, 512)")
+
+        conn.commit()
+
+    analytics = client.get_reading_history_analytics(year=2026)
+    assert analytics["books_completed"] == 2
+    # 385 + 512 = 897 pages
+    assert analytics["estimated_pages"] == 897
+    assert analytics["is_exact_pages"] is True
+    assert analytics["has_native_pages"] is True
+    assert analytics["books_with_page_count"] == 2
+
+
