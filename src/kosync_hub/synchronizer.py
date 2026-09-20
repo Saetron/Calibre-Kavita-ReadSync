@@ -396,18 +396,71 @@ class Synchronizer:
         logger.info(f"Backfill complete: imported {count} books into Books & Reading progress overview.")
         return count
 
+    async def sync_hub_to_remotes(self) -> int:
+        """
+        Synchronizes any progress stored in the hub's tracked_documents table
+        out to Calibre and Kavita if the hub has newer or farther progress.
+        """
+        if not self.calibre and not self.kavita:
+            return 0
+        updated = 0
+        all_docs = self.db.get_all_tracked_documents()
+        for doc in all_docs:
+            cal_id = doc["calibre_book_id"]
+            pct = float(doc["percentage"] or 0.0)
+            if not cal_id or pct <= 0:
+                continue
+
+            cal_book = self.calibre.get_book_by_id(cal_id) if self.calibre and hasattr(self.calibre, "get_book_by_id") else None
+            # 1. Push to Calibre if Calibre is behind
+            if self.calibre and cal_book and pct > cal_book.percentage:
+                logger.info(
+                    f"Syncing from Hub to Calibre for book #{cal_id} ('{cal_book.title}'): "
+                    f"{round(cal_book.percentage * 100, 1)}% -> {round(pct * 100, 1)}%"
+                )
+                self.calibre.update_book_progress(
+                    book_id=cal_id,
+                    percentage=pct,
+                    progress_str=doc["progress"],
+                    timestamp=doc["timestamp"],
+                )
+                updated += 1
+
+            # 2. Push to Kavita WebUI
+            if self.kavita:
+                rec = ProgressRecord(
+                    document=doc["document"],
+                    progress=doc["progress"] or f"page:{round(pct * 100, 1)}%",
+                    percentage=pct,
+                    timestamp=doc["timestamp"] or int(datetime.utcnow().timestamp()),
+                    device=doc["device"] or "CrossPoint",
+                    title=doc["title"] or (cal_book.title if cal_book else None),
+                    authors=doc["authors"] or (cal_book.authors if cal_book else None),
+                    filename=f"{doc['title'] or (cal_book.title if cal_book else 'Book')} {{{cal_id}}}.epub",
+                    calibre_id=cal_id,
+                )
+                try:
+                    await self.kavita.update_progress(rec)
+                except Exception as e:
+                    logger.debug(f"Failed to sync hub record #{cal_id} to Kavita: {e}")
+        return updated
+
     async def sync_all(self) -> Dict[str, Any]:
-        """Runs a complete bidirectional sync pass between Kavita and Calibre."""
+        """Runs a complete bidirectional sync pass between Kavita, Calibre, and Hub."""
         logger.info("Starting bidirectional sync pass between Kavita and Calibre DB...")
+        updated_hub = 0
         updated_calibre = 0
         updated_kavita = 0
         error_msg = None
 
         try:
-            # 1. Kavita -> Calibre
+            # 1. Hub tracked documents -> Calibre & Kavita
+            updated_hub = await self.sync_hub_to_remotes()
+
+            # 2. Kavita -> Calibre
             updated_calibre = await self.sync_kavita_to_calibre()
 
-            # 2. Calibre -> Kavita
+            # 3. Calibre -> Kavita
             updated_kavita = await self.sync_calibre_to_kavita()
 
             self.last_sync_status = "success"
@@ -419,9 +472,10 @@ class Synchronizer:
 
         self.last_sync_timestamp = int(datetime.utcnow().timestamp())
         logger.info(
-            f"Bidirectional sync completed: updated Calibre: {updated_calibre}, updated Kavita: {updated_kavita}."
+            f"Bidirectional sync completed: updated from Hub: {updated_hub}, updated Calibre: {updated_calibre}, updated Kavita: {updated_kavita}."
         )
         return {
+            "updated_hub": updated_hub,
             "updated_calibre": updated_calibre,
             "updated_kavita": updated_kavita,
             "timestamp": self.last_sync_timestamp,

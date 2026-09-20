@@ -91,3 +91,28 @@ async def test_bidirectional_sync_with_calibre_id():
         # Verify Kavita received progress for Dune (hash: 'dune_hash_12345')
         assert "dune_hash_12345" in mock_kavita.koreader_store
         assert mock_kavita.koreader_store["dune_hash_12345"].percentage == 0.75
+
+        # -------------------------------------------------------------
+        # Scenario 3: Device synced Book 55746 ("5 Centimeters Per Second")
+        # to Hub tracked_documents (2%). Verify sync_all pushes to both Calibre and Kavita!
+        # -------------------------------------------------------------
+        with internal_db._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO tracked_documents (document, device, percentage, progress, timestamp, calibre_book_id, title)
+                VALUES ('b77348322aece846b1c2a623ce97d4e4', 'CrossPoint', 0.02, 'page:2%', 1726794500, 55746, '5 Centimeters Per Second')
+                """
+            )
+            conn.commit()
+
+        res3 = await sync.sync_all()
+        assert res3["updated_hub"] >= 1
+
+        # Check Calibre DB updated to 2% (0.02)
+        book_55746 = calibre.get_book_by_id(55746)
+        assert book_55746 is not None
+        assert abs(book_55746.percentage - 0.02) < 0.001
+
+        # Check Kavita received progress
+        assert any(r.calibre_id == 55746 and abs(r.percentage - 0.02) < 0.001 for r in mock_kavita.pushed_records)
+
