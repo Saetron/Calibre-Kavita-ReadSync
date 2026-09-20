@@ -189,13 +189,13 @@ The VFS reader automatically discovers custom columns in Calibre for granular or
 
 ## WebUI Dashboard
 
-Open `http://<server-ip>:8080` to access the responsive 3-tab dashboard:
+Open `http://<server-ip>:8080` to access the responsive 4-tab dashboard:
 
 1. **📱 Reading Sync Tab**:
    - KOReader sync server URL and connection instructions.
-   - Summary cards: Total Tracked, Completed ($\ge 98\%$), In Progress, Syncs Today & 7 Days.
+   - Summary cards: Total Tracked, Completed ($\ge 98\%$), In Progress, Syncs Today & 7 Days, Distinct Connected Devices.
    - Searchable, paginated table of tracked books with real-time reading progress bars, Calibre IDs, and device badges.
-   - Real-time audit log with event filter.
+   - Real-time audit log with event pagination.
    - **Sync Now** and **Backfill Calibre** buttons.
 
 2. **🗂️ Kavita VFS Tab**:
@@ -204,7 +204,13 @@ Open `http://<server-ip>:8080` to access the responsive 3-tab dashboard:
    - Mapped books table with server-side debounced search and pagination.
    - **Sync VFS** and **Cleanup Unregistered** buttons.
 
-3. **⚙️ Settings Tab**:
+3. **📊 Statistics & Year in Review Tab**:
+   - **Year in Review**: Interactive year selector (`All Time`, `2026`, `2025`, etc.) showing books completed, estimated pages read, top authors read, peak reading month, and monthly completion bar chart.
+   - **Completed Books Table**: Detailed listing of books finished during the selected period with finish timestamps.
+   - **Calibre Library Analytics**: Total books, authors, series, tags/genres, library storage size in GB, format distribution badges, and Top 10 authors and series tables directly aggregated from `metadata.db`.
+   - **Database Maintenance & Optimization**: Live database file size metrics, table row counters (`filename_hashes`, `sync_events`, etc.), and one-click database cleanup with SQLite `VACUUM` to reclaim disk space.
+
+4. **⚙️ Settings Tab**:
    - Browser-based configuration editor for Server, Calibre, Kavita, Sync, and VFS settings.
    - Sensitive credentials masked automatically.
    - **Save Configuration** button commits updates directly to `config.yaml` on disk and instantly hot-reconfigures running services.
@@ -247,6 +253,10 @@ You can execute commands via `docker compose exec kosync-hub <command>`:
   ```bash
   docker compose exec kosync-hub kosync-hub vfs-cleanup
   ```
+- **Prune sync audit events, clear candidate hash caches, and vacuum database**:
+  ```bash
+  docker compose exec kosync-hub kosync-hub db-cleanup --days 14 --clear-hashes --vacuum
+  ```
 - **View tracked books and reading progress**:
   ```bash
   docker compose exec kosync-hub kosync-hub status
@@ -265,5 +275,6 @@ All unit test suites can be executed with `pytest`:
 source .venv/bin/activate
 pytest -v
 ```
-Currently covering 37 unit tests across VFS formatter, database caching, symlink/hardlink synchronization, reading progress fanout, Calibre database client, and configuration API.
+Currently covering 45 unit tests across VFS formatter, database caching, symlink/hardlink synchronization, reading progress fanout, Calibre database client, database maintenance/pruning, library analytics, and configuration API.
+
 
