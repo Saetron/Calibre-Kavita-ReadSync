@@ -17,6 +17,7 @@ from .clients.calibre_db import CalibreDbClient
 from .clients.kavita import KavitaClient
 from .server import create_app
 from .synchronizer import Synchronizer
+from .vfs import VFSManager
 
 console = Console()
 
@@ -31,7 +32,7 @@ def get_config(ctx: click.Context, config_path: Optional[str] = None) -> AppConf
 
 
 def init_components(config: AppConfig):
-    """Initializes database, clients, and synchronizer from configuration."""
+    """Initializes database, clients, synchronizer, and VFS manager from configuration."""
     db_file = Path(config.data_dir) / "kosync_hub.sqlite3"
     db = InternalDatabase(str(db_file))
 
@@ -65,7 +66,11 @@ def init_components(config: AppConfig):
         interval_seconds=config.sync.interval_seconds,
     )
 
-    return db, kavita, calibre, sync
+    vfs = None
+    if config.vfs.enabled:
+        vfs = VFSManager(config)
+
+    return db, kavita, calibre, sync, vfs
 
 
 @click.group()
@@ -91,10 +96,10 @@ def cli(ctx, config_path: Optional[str], verbose: bool = False):
 def serve(ctx, config_path: Optional[str] = None):
     """Starts the KOReader sync server and background synchronizer."""
     config: AppConfig = get_config(ctx, config_path)
-    db, kavita, calibre, sync = init_components(config)
+    db, kavita, calibre, sync, vfs = init_components(config)
 
     console.print(f"[bold cyan]Starting KOReader Multi-Sync Hub on {config.server.host}:{config.server.port}[/bold cyan]")
-    app = create_app(config=config, db=db, synchronizer=sync)
+    app = create_app(config=config, db=db, synchronizer=sync, vfs_manager=vfs)
     uvicorn.run(app, host=config.server.host, port=config.server.port, log_level="info")
 
 
@@ -112,15 +117,66 @@ def run(ctx, config_path: Optional[str] = None):
 def sync_now(ctx, config_path: Optional[str] = None):
     """Performs an immediate one-shot synchronization pass between Kavita and Calibre."""
     config: AppConfig = get_config(ctx, config_path)
-    _, _, _, sync = init_components(config)
+    _, _, _, sync, _ = init_components(config)
 
     async def _run():
-        console.print("[bold yellow]Running synchronization pass...[/bold yellow]")
+        console.print("[bold yellow]Running reading progress synchronization pass...[/bold yellow]")
         result = await sync.sync_all()
         console.print(
             f"[bold green]Sync pass completed![/bold green] "
             f"Updated Kavita: {result['updated_kavita']}, Updated Calibre: {result['updated_calibre']}."
         )
+
+    asyncio.run(_run())
+
+
+@cli.command("vfs-sync")
+@click.option("--config", "-c", "config_path", help="Path to config.yaml file.")
+@click.pass_context
+def vfs_sync(ctx, config_path: Optional[str] = None):
+    """Performs an immediate Kavita VFS directory synchronization pass."""
+    config: AppConfig = get_config(ctx, config_path)
+    _, _, _, _, vfs = init_components(config)
+
+    if not vfs:
+        console.print("[yellow]Kavita VFS is disabled in configuration.[/yellow]")
+        return
+
+    async def _run():
+        console.print(f"[bold yellow]Running Kavita VFS sync pass ({config.vfs.mode} mode -> {config.vfs.vfs_dir})...[/bold yellow]")
+        result = await vfs.sync_now(force=True)
+        if result.get("status") == "success":
+            console.print(
+                f"[bold green]VFS sync completed![/bold green] "
+                f"Total: {result.get('total')}, Created: {result.get('created')}, "
+                f"Updated: {result.get('updated')}, Deleted: {result.get('deleted')}, "
+                f"Collisions: {result.get('collisions')}."
+            )
+        else:
+            console.print(f"[bold red]VFS sync failed:[/bold red] {result.get('message')}")
+
+    asyncio.run(_run())
+
+
+@cli.command("vfs-cleanup")
+@click.option("--config", "-c", "config_path", help="Path to config.yaml file.")
+@click.pass_context
+def vfs_cleanup(ctx, config_path: Optional[str] = None):
+    """Cleans up unregistered files and converts link modes in the VFS directory."""
+    config: AppConfig = get_config(ctx, config_path)
+    _, _, _, _, vfs = init_components(config)
+
+    if not vfs:
+        console.print("[yellow]Kavita VFS is disabled in configuration.[/yellow]")
+        return
+
+    async def _run():
+        console.print(f"[bold yellow]Running Kavita VFS cleanup ({config.vfs.vfs_dir})...[/bold yellow]")
+        result = await vfs.cleanup()
+        if result.get("status") == "success":
+            console.print(f"[bold green]VFS cleanup completed![/bold green] Result: {result.get('result')}")
+        else:
+            console.print(f"[bold red]VFS cleanup failed:[/bold red] {result.get('message')}")
 
     asyncio.run(_run())
 
@@ -131,7 +187,7 @@ def sync_now(ctx, config_path: Optional[str] = None):
 def test_connections(ctx, config_path: Optional[str] = None):
     """Verifies credentials, connectivity, and book discovery for Kavita and Calibre."""
     config: AppConfig = get_config(ctx, config_path)
-    _, kavita, calibre, _ = init_components(config)
+    _, kavita, calibre, _, vfs = init_components(config)
 
     async def _test():
         console.print("\n[bold]Testing Service Connections:[/bold]")
@@ -171,6 +227,16 @@ def test_connections(ctx, config_path: Optional[str] = None):
         else:
             console.print("[yellow]– Calibre:[/yellow] Disabled in config")
 
+        if vfs:
+            vfs_dir = Path(config.vfs.vfs_dir)
+            console.print(f"[green]✔ Kavita VFS:[/green] Enabled (Mode: [bold]{config.vfs.mode}[/bold], Target: {vfs_dir})")
+            if not vfs_dir.exists():
+                console.print(f"  [yellow]⚠ VFS directory does not exist yet (will be created on first sync): {vfs_dir}[/yellow]")
+            else:
+                console.print(f"  [dim]VFS directory exists and is ready.[/dim]")
+        else:
+            console.print("[yellow]– Kavita VFS:[/yellow] Disabled in config")
+
     asyncio.run(_test())
 
 
@@ -181,7 +247,7 @@ def test_connections(ctx, config_path: Optional[str] = None):
 def scan_calibre(ctx, limit: Optional[int], config_path: Optional[str] = None):
     """Scans the Calibre library, generates KOReader hashes, and indexes them."""
     config: AppConfig = get_config(ctx, config_path)
-    _, _, calibre, _ = init_components(config)
+    _, _, calibre, _, _ = init_components(config)
 
     if not calibre:
         console.print("[red]Calibre integration is disabled in configuration.[/red]")
@@ -199,7 +265,7 @@ def scan_calibre(ctx, limit: Optional[int], config_path: Optional[str] = None):
 def status(ctx, config_path: Optional[str] = None):
     """Displays tracked books and synchronization status."""
     config: AppConfig = get_config(ctx, config_path)
-    db, _, _, _ = init_components(config)
+    db, _, _, _, _ = init_components(config)
 
     docs = db.get_all_tracked_documents()
     if not docs:

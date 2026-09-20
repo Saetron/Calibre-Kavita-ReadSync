@@ -17,8 +17,12 @@ services:
       # Mount your Calibre library directory (where metadata.db is located)
       # e.g., if using linuxserver/calibre, point to your library path:
       - /path/to/your/calibre/library:/calibre/library:rw
-      # Configuration file
-      - ./config.yaml:/app/config/config.yaml:ro
+      # Mount the VFS output directory (Kavita library source)
+      # NOTE: If using Hardlink mode (default), both Calibre and VFS should ideally share
+      # the same filesystem / volume mount (e.g. - /mnt/media/books:/books:rw)
+      - /path/to/kavita/vfs_library:/vfs:rw
+      # Configuration file (rw allows saving settings from the WebUI)
+      - ./config.yaml:/app/config/config.yaml:rw
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/healthcheck"]
       interval: 30s

@@ -17,12 +17,14 @@ COPY src/ ./src/
 RUN pip install --no-cache-dir -e .
 
 # Create volume directories
-RUN mkdir -p /app/data /app/config /calibre/library
+RUN mkdir -p /app/data /app/config /calibre/library /vfs
 
 EXPOSE 8080
 
 ENV DATA_DIR=/app/data
 ENV CALIBRE_LIBRARY_PATH=/calibre/library
+ENV VFS_DIR=/vfs
+ENV VFS_MODE=hardlink
 
 ENTRYPOINT ["kosync-hub"]
 CMD ["serve", "--config", "/app/config/config.yaml"]
