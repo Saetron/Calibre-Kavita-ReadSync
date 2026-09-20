@@ -203,7 +203,8 @@ class Synchronizer:
             kavita_prog = f"page:{item.pages_read}/{item.total_pages}" if item.total_pages > 0 else f"page:{round(kavita_pct * 100, 1)}%"
             kavita_ts = now_ts
 
-            existing = self.db.get_tracked_document_by_calibre_id(cal_id)
+            existing_row = self.db.get_tracked_document_by_calibre_id(cal_id)
+            existing = dict(existing_row) if existing_row else None
             existing_pct = float(existing["percentage"] or 0.0) if existing else 0.0
 
             # Check if Kavita KOReader sync endpoint has newer/more granular progress
@@ -227,8 +228,8 @@ class Synchronizer:
                 or (kavita_pct == existing_pct and kavita_pct > 0 and kavita_prog != existing["progress"])
             ):
                 doc_hash = ko_hash or f"kavita_{cal_id}"
-                title = existing["title"] if existing and existing.get("title") else item.series_name
-                authors = existing["authors"] if existing else None
+                title = (existing.get("title") if existing else None) or item.series_name or "Unknown"
+                authors = existing.get("authors") if existing else None
                 if self.calibre:
                     cal_book = self.calibre.get_book_by_id(cal_id)
                     if cal_book:

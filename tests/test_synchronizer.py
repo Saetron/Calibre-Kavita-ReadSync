@@ -263,4 +263,67 @@ async def test_crosspoint_unlinked_hash_full_star_sync():
         assert any(r.calibre_id == 55746 and abs(r.percentage - 0.02) < 0.001 for r in mock_kavita.pushed_records)
 
 
+@pytest.mark.asyncio
+async def test_pull_kavita_to_hub_with_existing_tracked_document():
+    """Verify pull_kavita_to_hub does not crash with AttributeError on sqlite3.Row when a book is already tracked."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        db_file = tmp_path / "kosync_hub.sqlite3"
+        internal_db = InternalDatabase(str(db_file))
+
+        calibre_dir = tmp_path / "calibre"
+        calibre_dir.mkdir()
+        create_mock_calibre_db(calibre_dir)
+
+        calibre = CalibreDbClient(library_path=str(calibre_dir))
+        await calibre.test_connection()
+
+        # Pre-insert existing tracked document for book 2 ("The Hobbit")
+        with internal_db._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO tracked_documents (
+                    document, device, percentage, progress, timestamp, calibre_book_id, title, authors
+                ) VALUES (
+                    'hobbit_existing_hash', 'KOReader', 0.20, 'page:20%', 1726790000, 2, 'The Hobbit', 'J.R.R. Tolkien'
+                )
+                """
+            )
+            conn.commit()
+
+        # Verify get_tracked_document_by_calibre_id returns an sqlite3.Row
+        existing = internal_db.get_tracked_document_by_calibre_id(2)
+        assert isinstance(existing, sqlite3.Row)
+
+        mock_kavita = MockKavitaClient()
+        mock_kavita.on_deck_items = [
+            KavitaRecentRead(
+                series_id=1,
+                series_name="The Hobbit Series",
+                filename="The Hobbit {2}.epub",
+                calibre_id=2,
+                pages_read=180,
+                total_pages=300,
+                percentage=0.60,
+            )
+        ]
+
+        sync = Synchronizer(
+            db=internal_db,
+            kavita=mock_kavita,
+            calibre=calibre,
+            interval_seconds=60,
+        )
+
+        # Pull from Kavita into Hub — must NOT raise AttributeError: 'sqlite3.Row' object has no attribute 'get'
+        pulled = await sync.pull_kavita_to_hub()
+        assert pulled == 1
+
+        updated = internal_db.get_tracked_document_by_calibre_id(2)
+        assert updated is not None
+        assert abs(float(updated["percentage"]) - 0.60) < 0.01
+        assert "The Hobbit" in updated["title"]
+
+
+
 
