@@ -71,6 +71,7 @@ def create_app(
 
     @app.get("/users/auth", status_code=status.HTTP_200_OK)
     @app.get("/koreader/users/auth", status_code=status.HTTP_200_OK)
+    @app.get("/sync/users/auth", status_code=status.HTTP_200_OK)
     async def users_auth(
         x_auth_user: Optional[str] = Header(None),
         x_auth_key: Optional[str] = Header(None),
@@ -79,6 +80,7 @@ def create_app(
 
     @app.post("/users/create", status_code=status.HTTP_201_CREATED)
     @app.post("/koreader/users/create", status_code=status.HTTP_201_CREATED)
+    @app.post("/sync/users/create", status_code=status.HTTP_201_CREATED)
     async def users_create(payload: UserAuthRequest):
         """KOReader user registration endpoint."""
         logger.info(f"User registration request received for '{payload.username}'")
@@ -173,6 +175,8 @@ def create_app(
 
     @app.put("/syncs/progress", status_code=status.HTTP_200_OK)
     @app.put("/koreader/syncs/progress", status_code=status.HTTP_200_OK)
+    @app.put("/sync/syncs/progress", status_code=status.HTTP_200_OK)
+    @app.put("/sync/progress", status_code=status.HTTP_200_OK)
     async def update_progress(payload: ProgressPayload):
         return await _handle_update_progress(payload)
 
@@ -209,6 +213,8 @@ def create_app(
 
     @app.get("/syncs/progress/{document}", response_model=ProgressResponse)
     @app.get("/koreader/syncs/progress/{document}", response_model=ProgressResponse)
+    @app.get("/sync/syncs/progress/{document}", response_model=ProgressResponse)
+    @app.get("/sync/progress/{document}", response_model=ProgressResponse)
     async def get_progress(document: str):
         return await _handle_get_progress(document)
 
