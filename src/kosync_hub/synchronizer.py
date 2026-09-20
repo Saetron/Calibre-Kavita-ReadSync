@@ -110,112 +110,185 @@ class Synchronizer:
 
         return {"document": document, "synced": True, "winner": device_rec}
 
-    async def sync_kavita_to_calibre(self) -> int:
+    async def pull_calibre_to_hub(self) -> int:
         """
-        Fetches recent reads from Kavita (On Deck / continue reading),
-        extracts Calibre IDs from {id} in filenames, and syncs progress into Calibre DB.
+        Ingress: Pulls reading progress from Calibre DB into the Hub's tracked_documents.
+        Only updates Hub if Calibre's progress is ahead or not yet tracked.
         """
-        if not self.kavita or not self.calibre:
+        if not self.calibre:
             return 0
 
-        updated_count = 0
+        pulled_count = 0
+        now_ts = int(datetime.utcnow().timestamp())
+        recent_books = self.calibre.get_recently_read_books(limit=100)
+
+        for book in recent_books:
+            if book.percentage <= 0 and not book.is_read:
+                continue
+
+            cal_pct = 1.0 if book.is_read and book.percentage < 0.98 else book.percentage
+            cal_id = book.book_id
+
+            existing = self.db.get_tracked_document_by_calibre_id(cal_id)
+            existing_pct = float(existing["percentage"] or 0.0) if existing else 0.0
+
+            if (
+                not existing
+                or cal_pct > existing_pct
+                or (cal_pct == existing_pct and existing_pct > 0 and book.koreader_progress and book.koreader_progress != existing["progress"])
+            ):
+                doc_hash = (
+                    book.koreader_hash
+                    or (existing["document"] if existing else None)
+                    or self.calibre.get_or_compute_koreader_hash(cal_id)
+                    or f"calibre_{cal_id}"
+                )
+                progress_str = book.koreader_progress or (f"page:{round(cal_pct * 100, 1)}%" if cal_pct > 0 else "0")
+                record = ProgressRecord(
+                    document=doc_hash,
+                    progress=progress_str,
+                    percentage=cal_pct,
+                    timestamp=now_ts,
+                    device="Calibre",
+                    title=book.title,
+                    authors=book.authors,
+                    filename=f"{book.title} {{{cal_id}}}.{book.format.lower() if book.format else 'epub'}",
+                    calibre_id=cal_id,
+                )
+                self.db.upsert_progress(
+                    record=record,
+                    calibre_book_id=cal_id,
+                    calibre_synced_at=now_ts,
+                    sync_status="synced",
+                )
+                self.db.log_sync_event(
+                    SyncEvent(
+                        document=doc_hash,
+                        calibre_id=cal_id,
+                        source="calibre",
+                        target="hub",
+                        progress=progress_str,
+                        percentage=cal_pct,
+                        timestamp=now_ts,
+                        success=True,
+                        message=f"Pulled Calibre #{cal_id} ('{book.title}') into Hub ({round(cal_pct * 100, 1)}%)",
+                    )
+                )
+                pulled_count += 1
+                logger.info(f"Pulled reading progress from Calibre for book #{cal_id} ('{book.title}'): {round(cal_pct * 100, 1)}%")
+
+        return pulled_count
+
+    async def pull_kavita_to_hub(self) -> int:
+        """
+        Ingress: Pulls reading progress from Kavita (On Deck / Currently Reading & KOReader endpoint)
+        into the Hub's tracked_documents.
+        Only updates Hub if Kavita's progress is ahead or not yet tracked.
+        """
+        if not self.kavita:
+            return 0
+
+        pulled_count = 0
+        now_ts = int(datetime.utcnow().timestamp())
         recent_reads = await self.kavita.get_on_deck_reads()
+        seen_calibre_ids = set()
 
         for item in recent_reads:
-            calibre_id = item.calibre_id
-            if calibre_id is None:
+            cal_id = item.calibre_id
+            if cal_id is None:
                 continue
 
-            calibre_book = self.calibre.get_book_by_id(calibre_id)
-            if not calibre_book:
-                logger.debug(f"Book with Calibre ID {calibre_id} ('{item.filename}') not found in Calibre DB.")
-                continue
-
+            seen_calibre_ids.add(cal_id)
             kavita_pct = item.percentage
-            kavita_progress_str = f"page:{item.pages_read}/{item.total_pages}"
-            kavita_ts = int(datetime.utcnow().timestamp())
+            kavita_prog = f"page:{item.pages_read}/{item.total_pages}" if item.total_pages > 0 else f"page:{round(kavita_pct * 100, 1)}%"
+            kavita_ts = now_ts
+
+            existing = self.db.get_tracked_document_by_calibre_id(cal_id)
+            existing_pct = float(existing["percentage"] or 0.0) if existing else 0.0
 
             # Check if Kavita KOReader sync endpoint has newer/more granular progress
-            if calibre_book.koreader_hash:
-                ko_record = await self.kavita.get_progress(calibre_book.koreader_hash)
+            ko_hash = (existing["document"] if existing else None)
+            if not ko_hash and self.calibre:
+                cal_book = self.calibre.get_book_by_id(cal_id)
+                if cal_book:
+                    ko_hash = cal_book.koreader_hash or self.calibre.get_or_compute_koreader_hash(cal_id)
+
+            if ko_hash:
+                ko_record = await self.kavita.get_progress(ko_hash)
                 if ko_record:
                     if ko_record.percentage > kavita_pct:
                         kavita_pct = ko_record.percentage
-                        kavita_progress_str = ko_record.progress
-                        kavita_ts = ko_record.timestamp
+                        kavita_prog = ko_record.progress
+                        kavita_ts = ko_record.timestamp or now_ts
 
-            # Compare with Calibre's current percentage
-            if kavita_pct > calibre_book.percentage or (kavita_pct == calibre_book.percentage and kavita_pct > 0 and calibre_book.koreader_progress != kavita_progress_str):
-                logger.info(
-                    f"Syncing from Kavita to Calibre for book #{calibre_id} ('{calibre_book.title}'): "
-                    f"{round(calibre_book.percentage * 100, 1)}% -> {round(kavita_pct * 100, 1)}%"
-                )
-                ok = self.calibre.update_book_progress(
-                    book_id=calibre_id,
+            if (
+                not existing
+                or kavita_pct > existing_pct
+                or (kavita_pct == existing_pct and kavita_pct > 0 and kavita_prog != existing["progress"])
+            ):
+                doc_hash = ko_hash or f"kavita_{cal_id}"
+                title = existing["title"] if existing and existing.get("title") else item.series_name
+                authors = existing["authors"] if existing else None
+                if self.calibre:
+                    cal_book = self.calibre.get_book_by_id(cal_id)
+                    if cal_book:
+                        title = cal_book.title or title
+                        authors = cal_book.authors or authors
+
+                record = ProgressRecord(
+                    document=doc_hash,
+                    progress=kavita_prog,
                     percentage=kavita_pct,
-                    progress_str=kavita_progress_str,
                     timestamp=kavita_ts,
+                    device="Kavita",
+                    title=title,
+                    authors=authors,
+                    filename=item.filename or f"{title} {{{cal_id}}}.epub",
+                    calibre_id=cal_id,
                 )
-                if ok:
-                    updated_count += 1
-                    doc_hash = calibre_book.koreader_hash or f"calibre_{calibre_id}"
-                    record = ProgressRecord(
+                self.db.upsert_progress(
+                    record=record,
+                    calibre_book_id=cal_id,
+                    kavita_synced_at=kavita_ts,
+                    sync_status="synced",
+                )
+                self.db.log_sync_event(
+                    SyncEvent(
                         document=doc_hash,
-                        progress=kavita_progress_str,
+                        calibre_id=cal_id,
+                        source="kavita",
+                        target="hub",
+                        progress=kavita_prog,
                         percentage=kavita_pct,
                         timestamp=kavita_ts,
-                        device="Kavita",
-                        title=calibre_book.title,
-                        authors=calibre_book.authors,
-                        calibre_id=calibre_id,
+                        success=True,
+                        message=f"Pulled Kavita #{cal_id} ('{title}') into Hub ({round(kavita_pct * 100, 1)}%)",
                     )
-                    self.db.upsert_progress(
-                        record=record,
-                        calibre_book_id=calibre_id,
-                        kavita_synced_at=kavita_ts,
-                        calibre_synced_at=kavita_ts,
-                        sync_status="synced_to_calibre",
-                    )
-                    self.db.log_sync_event(
-                        SyncEvent(
-                            document=doc_hash,
-                            calibre_id=calibre_id,
-                            source="kavita",
-                            target="calibre",
-                            progress=kavita_progress_str,
-                            percentage=kavita_pct,
-                            timestamp=kavita_ts,
-                            success=True,
-                            message=f"Synced from Kavita to Calibre #{calibre_id} ({round(kavita_pct * 100, 1)}%)",
-                        )
-                    )
+                )
+                pulled_count += 1
+                logger.info(f"Pulled reading progress from Kavita for book #{cal_id} ('{title}'): {round(kavita_pct * 100, 1)}%")
 
-        # Also check Calibre's recent books that have KOReader hashes directly against Kavita KOReader endpoint
-        calibre_recent = self.calibre.get_recently_read_books(limit=30)
-        checked_calibre_ids = {r.calibre_id for r in recent_reads if r.calibre_id is not None}
-        for book in calibre_recent:
-            if book.book_id in checked_calibre_ids:
-                continue
-            hsh = book.koreader_hash or self.calibre.get_or_compute_koreader_hash(book.book_id)
-            if not hsh:
-                continue
-            ko_rec = await self.kavita.get_progress(hsh)
-            if ko_rec and (
-                ko_rec.percentage > book.percentage
-                or (ko_rec.percentage == book.percentage and ko_rec.percentage > 0 and book.koreader_progress != ko_rec.progress)
-            ):
-                logger.info(
-                    f"Syncing from Kavita KOReader endpoint to Calibre for book #{book.book_id} ('{book.title}'): "
-                    f"{round(book.percentage * 100, 1)}% -> {round(ko_rec.percentage * 100, 1)}%"
-                )
-                ok = self.calibre.update_book_progress(
-                    book_id=book.book_id,
-                    percentage=ko_rec.percentage,
-                    progress_str=ko_rec.progress,
-                    timestamp=ko_rec.timestamp,
-                )
-                if ok:
-                    updated_count += 1
+        # Also check Calibre recent books that have KOReader hashes directly against Kavita KOReader endpoint
+        if self.calibre:
+            calibre_recent = self.calibre.get_recently_read_books(limit=30)
+            for book in calibre_recent:
+                if book.book_id in seen_calibre_ids:
+                    continue
+                hsh = book.koreader_hash or self.calibre.get_or_compute_koreader_hash(book.book_id)
+                if not hsh:
+                    continue
+                ko_rec = await self.kavita.get_progress(hsh)
+                if not ko_rec or ko_rec.percentage <= 0:
+                    continue
+
+                existing = self.db.get_tracked_document_by_calibre_id(book.book_id)
+                existing_pct = float(existing["percentage"] or 0.0) if existing else 0.0
+
+                if (
+                    not existing
+                    or ko_rec.percentage > existing_pct
+                    or (ko_rec.percentage == existing_pct and ko_rec.percentage > 0 and ko_rec.progress != existing["progress"])
+                ):
                     ko_rec.title = book.title
                     ko_rec.authors = book.authors
                     ko_rec.calibre_id = book.book_id
@@ -224,104 +297,211 @@ class Synchronizer:
                         record=ko_rec,
                         calibre_book_id=book.book_id,
                         kavita_synced_at=ko_rec.timestamp,
-                        calibre_synced_at=ko_rec.timestamp,
-                        sync_status="synced_to_calibre",
+                        sync_status="synced",
                     )
                     self.db.log_sync_event(
                         SyncEvent(
                             document=hsh,
                             calibre_id=book.book_id,
                             source="kavita_koreader_endpoint",
-                            target="calibre",
+                            target="hub",
                             progress=ko_rec.progress,
                             percentage=ko_rec.percentage,
                             timestamp=ko_rec.timestamp,
                             success=True,
-                            message=f"Synced KOReader progress from Kavita to Calibre #{book.book_id} ({round(ko_rec.percentage * 100, 1)}%)",
+                            message=f"Pulled KOReader progress from Kavita for #{book.book_id} ('{book.title}') into Hub ({round(ko_rec.percentage * 100, 1)}%)",
                         )
                     )
-                    # Also make sure Kavita WebUI has this reading progress marked
-                    try:
-                        await self.kavita.update_webui_progress(
-                            calibre_id=book.book_id,
-                            percentage=ko_rec.percentage,
-                            title=book.title,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to update Kavita WebUI for #{book.book_id}: {e}")
+                    pulled_count += 1
+                    logger.info(f"Pulled KOReader progress from Kavita for #{book.book_id} ('{book.title}'): {round(ko_rec.percentage * 100, 1)}%")
 
-        return updated_count
+        return pulled_count
 
-    async def sync_calibre_to_kavita(self) -> int:
+    async def reconcile_hub(self) -> int:
         """
-        Fetches recently read/updated books from Calibre DB.
-        If Calibre progress is ahead of Kavita, pushes update to Kavita's KOReader endpoint.
+        Reconciliation: Runs internal Hub reconciliation:
+          1. Resolves missing Calibre IDs / titles for documents pushed by e-readers (CrossPoint / KOReader).
+          2. Merges duplicate tracked_documents sharing the same Calibre ID into a single winning record.
         """
-        if not self.kavita or not self.calibre:
+        reconciled = 0
+        if self.calibre and hasattr(self.calibre, "get_book_by_id"):
+            repaired = self.db.repair_missing_titles(
+                self.calibre.get_book_by_id,
+                getattr(self.calibre, "find_book_by_hash", None),
+                getattr(self.calibre, "find_book_by_filename_hash", None),
+            )
+            reconciled += repaired
+            if repaired > 0:
+                logger.info(f"Reconciled {repaired} documents with Calibre database metadata.")
+
+        merged = self.db.merge_duplicate_calibre_entries()
+        reconciled += merged
+        if merged > 0:
+            logger.info(f"Merged {merged} duplicate Calibre document entries in Hub.")
+
+        return reconciled
+
+    async def push_hub_to_calibre(self) -> int:
+        """
+        Egress: Pushes reading progress from Hub's tracked_documents out to Calibre DB.
+        Only updates Calibre if Hub's progress is ahead or has newer progress.
+        """
+        if not self.calibre:
             return 0
 
-        updated_count = 0
-        recent_books = self.calibre.get_recently_read_books(limit=30)
+        pushed_count = 0
+        now_ts = int(datetime.utcnow().timestamp())
+        all_docs = self.db.get_all_tracked_documents()
 
-        for book in recent_books:
-            if book.percentage <= 0:
+        for doc in all_docs:
+            cal_id = doc["calibre_book_id"]
+            pct = float(doc["percentage"] or 0.0)
+            if not cal_id or pct <= 0:
                 continue
 
-            hsh = book.koreader_hash or self.calibre.get_or_compute_koreader_hash(book.book_id)
-            if not hsh:
+            cal_book = self.calibre.get_book_by_id(cal_id)
+            if not cal_book:
                 continue
 
-            # Check Kavita's current KOReader progress
-            kavita_rec = await self.kavita.get_progress(hsh)
-            kavita_pct = kavita_rec.percentage if kavita_rec else 0.0
-
-            # If Calibre is ahead of Kavita
-            if book.percentage > kavita_pct:
+            if (
+                pct > cal_book.percentage
+                or (pct == cal_book.percentage and pct > 0 and cal_book.koreader_progress != doc["progress"])
+            ):
                 logger.info(
-                    f"Syncing from Calibre to Kavita for book #{book.book_id} ('{book.title}'): "
-                    f"{round(kavita_pct * 100, 1)}% -> {round(book.percentage * 100, 1)}%"
+                    f"Pushing from Hub to Calibre for book #{cal_id} ('{cal_book.title}'): "
+                    f"{round(cal_book.percentage * 100, 1)}% -> {round(pct * 100, 1)}%"
                 )
-                now_ts = int(datetime.utcnow().timestamp())
-                record = ProgressRecord(
-                    document=hsh,
-                    progress=book.koreader_progress or f"page:{round(book.percentage * 100, 1)}%",
-                    percentage=book.percentage,
-                    timestamp=now_ts,
-                    device="Calibre",
-                    title=book.title,
-                    authors=book.authors,
-                    filename=f"{book.title} {{{book.book_id}}}.{book.format.lower() if book.format else 'epub'}",
-                    calibre_id=book.book_id,
+                ok = self.calibre.update_book_progress(
+                    book_id=cal_id,
+                    percentage=pct,
+                    progress_str=doc["progress"],
+                    timestamp=doc["timestamp"] or now_ts,
                 )
-                ok = await self.kavita.update_progress(record)
                 if ok:
-                    updated_count += 1
-                    self.db.upsert_progress(
-                        record=record,
-                        calibre_book_id=book.book_id,
-                        kavita_synced_at=now_ts,
+                    pushed_count += 1
+                    self.db.update_sync_timestamps(
+                        calibre_id=cal_id,
                         calibre_synced_at=now_ts,
-                        sync_status="synced_to_kavita",
+                        sync_status="synced_to_calibre",
                     )
                     self.db.log_sync_event(
                         SyncEvent(
-                            document=hsh,
-                            calibre_id=book.book_id,
-                            source="calibre",
-                            target="kavita",
-                            progress=record.progress,
-                            percentage=record.percentage,
+                            document=doc["document"],
+                            calibre_id=cal_id,
+                            source="hub",
+                            target="calibre",
+                            progress=doc["progress"],
+                            percentage=pct,
                             timestamp=now_ts,
                             success=True,
-                            message=f"Pushed Calibre #{book.book_id} ({round(record.percentage * 100, 1)}%) to Kavita KOReader endpoint",
+                            message=f"Pushed progress from Hub to Calibre #{cal_id} ({round(pct * 100, 1)}%)",
                         )
                     )
 
-        return updated_count
+        return pushed_count
+
+    async def push_hub_to_kavita(self) -> int:
+        """
+        Egress: Pushes reading progress from Hub's tracked_documents out to Kavita (KOReader endpoint & WebUI).
+        Only updates Kavita if Hub's progress is ahead or needs syncing.
+        """
+        if not self.kavita:
+            return 0
+
+        pushed_count = 0
+        now_ts = int(datetime.utcnow().timestamp())
+        all_docs = self.db.get_all_tracked_documents()
+
+        for doc in all_docs:
+            cal_id = doc["calibre_book_id"]
+            pct = float(doc["percentage"] or 0.0)
+            if not cal_id or pct <= 0:
+                continue
+
+            hsh = doc["document"]
+            if cal_id and self.calibre:
+                cal_book = self.calibre.get_book_by_id(cal_id)
+                if cal_book and cal_book.koreader_hash:
+                    hsh = cal_book.koreader_hash
+
+            kavita_rec = await self.kavita.get_progress(hsh)
+            kavita_pct = kavita_rec.percentage if kavita_rec else 0.0
+
+            kavita_synced = doc["kavita_synced_at"]
+            doc_ts = doc["timestamp"] or 0
+
+            # Needs push if Hub percentage is ahead of Kavita KOReader endpoint,
+            # or if never synced to Kavita, or if Hub timestamp is newer than last Kavita sync
+            needs_push = (
+                pct > kavita_pct
+                or not kavita_synced
+                or (doc_ts > kavita_synced and pct >= kavita_pct)
+            )
+
+            if needs_push:
+                logger.info(
+                    f"Pushing from Hub to Kavita for book #{cal_id} ('{doc['title'] or ''}'): "
+                    f"{round(kavita_pct * 100, 1)}% -> {round(pct * 100, 1)}%"
+                )
+                rec = ProgressRecord(
+                    document=hsh,
+                    progress=doc["progress"] or f"page:{round(pct * 100, 1)}%",
+                    percentage=pct,
+                    timestamp=doc_ts or now_ts,
+                    device=doc["device"] or "Hub",
+                    title=doc["title"],
+                    authors=doc["authors"],
+                    filename=doc["filename"] or f"{doc['title'] or 'Book'} {{{cal_id}}}.epub",
+                    calibre_id=cal_id,
+                )
+                try:
+                    ok = await self.kavita.update_progress(rec)
+                    if ok:
+                        pushed_count += 1
+                        self.db.update_sync_timestamps(
+                            calibre_id=cal_id,
+                            kavita_synced_at=now_ts,
+                            sync_status="synced_to_kavita",
+                        )
+                        self.db.log_sync_event(
+                            SyncEvent(
+                                document=hsh,
+                                calibre_id=cal_id,
+                                source="hub",
+                                target="kavita",
+                                progress=rec.progress,
+                                percentage=pct,
+                                timestamp=now_ts,
+                                success=True,
+                                message=f"Pushed progress from Hub to Kavita #{cal_id} ({round(pct * 100, 1)}%)",
+                            )
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to push hub record #{cal_id} to Kavita: {e}")
+
+        return pushed_count
+
+    async def sync_hub_to_remotes(self) -> int:
+        """Pushes Hub tracked progress out to both Calibre and Kavita."""
+        p_cal = await self.push_hub_to_calibre()
+        p_kav = await self.push_hub_to_kavita()
+        return p_cal + p_kav
+
+    async def sync_kavita_to_calibre(self) -> int:
+        """Pulls recent reads from Kavita into Hub, reconciles, and pushes winning progress to Calibre."""
+        await self.pull_kavita_to_hub()
+        await self.reconcile_hub()
+        return await self.push_hub_to_calibre()
+
+    async def sync_calibre_to_kavita(self) -> int:
+        """Pulls recent reads from Calibre into Hub, reconciles, and pushes winning progress to Kavita."""
+        await self.pull_calibre_to_hub()
+        await self.reconcile_hub()
+        return await self.push_hub_to_kavita()
 
     async def backfill_calibre_books(self) -> int:
         """
-        Backfills all books with reading progress from Calibre into the internal database
+        Backfills all books with reading progress from Calibre into the internal database (Hub)
         and syncs them to Kavita (WebUI & KOReader endpoint).
         """
         if not self.calibre:
@@ -396,88 +576,62 @@ class Synchronizer:
         logger.info(f"Backfill complete: imported {count} books into Books & Reading progress overview.")
         return count
 
-    async def sync_hub_to_remotes(self) -> int:
-        """
-        Synchronizes any progress stored in the hub's tracked_documents table
-        out to Calibre and Kavita if the hub has newer or farther progress.
-        """
-        if not self.calibre and not self.kavita:
-            return 0
-        updated = 0
-        all_docs = self.db.get_all_tracked_documents()
-        for doc in all_docs:
-            cal_id = doc["calibre_book_id"]
-            pct = float(doc["percentage"] or 0.0)
-            if not cal_id or pct <= 0:
-                continue
-
-            cal_book = self.calibre.get_book_by_id(cal_id) if self.calibre and hasattr(self.calibre, "get_book_by_id") else None
-            # 1. Push to Calibre if Calibre is behind
-            if self.calibre and cal_book and pct > cal_book.percentage:
-                logger.info(
-                    f"Syncing from Hub to Calibre for book #{cal_id} ('{cal_book.title}'): "
-                    f"{round(cal_book.percentage * 100, 1)}% -> {round(pct * 100, 1)}%"
-                )
-                self.calibre.update_book_progress(
-                    book_id=cal_id,
-                    percentage=pct,
-                    progress_str=doc["progress"],
-                    timestamp=doc["timestamp"],
-                )
-                updated += 1
-
-            # 2. Push to Kavita WebUI
-            if self.kavita:
-                rec = ProgressRecord(
-                    document=doc["document"],
-                    progress=doc["progress"] or f"page:{round(pct * 100, 1)}%",
-                    percentage=pct,
-                    timestamp=doc["timestamp"] or int(datetime.utcnow().timestamp()),
-                    device=doc["device"] or "CrossPoint",
-                    title=doc["title"] or (cal_book.title if cal_book else None),
-                    authors=doc["authors"] or (cal_book.authors if cal_book else None),
-                    filename=f"{doc['title'] or (cal_book.title if cal_book else 'Book')} {{{cal_id}}}.epub",
-                    calibre_id=cal_id,
-                )
-                try:
-                    await self.kavita.update_progress(rec)
-                except Exception as e:
-                    logger.debug(f"Failed to sync hub record #{cal_id} to Kavita: {e}")
-        return updated
-
     async def sync_all(self) -> Dict[str, Any]:
-        """Runs a complete bidirectional sync pass between Kavita, Calibre, and Hub."""
-        logger.info("Starting bidirectional sync pass between Kavita and Calibre DB...")
-        updated_hub = 0
-        updated_calibre = 0
-        updated_kavita = 0
+        """
+        Runs a complete Star-Topology sync pass:
+        Phase 1: Ingress (Spokes -> Hub)
+          - Pull Calibre -> Hub
+          - Pull Kavita -> Hub
+        Phase 2: Reconciliation (Hub internal)
+          - Reconcile missing Calibre IDs / titles & merge duplicate hashes
+        Phase 3: Egress (Hub -> Spokes)
+          - Push Hub -> Calibre
+          - Push Hub -> Kavita
+        """
+        logger.info("Starting Star-Topology sync pass between Spokes and Hub...")
+        pulled_calibre = 0
+        pulled_kavita = 0
+        reconciled = 0
+        pushed_calibre = 0
+        pushed_kavita = 0
         error_msg = None
 
         try:
-            # 1. Hub tracked documents -> Calibre & Kavita
-            updated_hub = await self.sync_hub_to_remotes()
+            # Phase 1: Ingress
+            pulled_calibre = await self.pull_calibre_to_hub()
+            pulled_kavita = await self.pull_kavita_to_hub()
 
-            # 2. Kavita -> Calibre
-            updated_calibre = await self.sync_kavita_to_calibre()
+            # Phase 2: Reconciliation
+            reconciled = await self.reconcile_hub()
 
-            # 3. Calibre -> Kavita
-            updated_kavita = await self.sync_calibre_to_kavita()
+            # Phase 3: Egress
+            pushed_calibre = await self.push_hub_to_calibre()
+            pushed_kavita = await self.push_hub_to_kavita()
 
             self.last_sync_status = "success"
             self.sync_count += 1
         except Exception as e:
-            logger.error(f"Error during bidirectional sync: {e}")
+            logger.error(f"Error during Hub-and-Spoke sync: {e}", exc_info=True)
             self.last_sync_status = f"error: {str(e)}"
             error_msg = str(e)
 
         self.last_sync_timestamp = int(datetime.utcnow().timestamp())
         logger.info(
-            f"Bidirectional sync completed: updated from Hub: {updated_hub}, updated Calibre: {updated_calibre}, updated Kavita: {updated_kavita}."
+            f"Hub-and-Spoke sync completed: "
+            f"pulled Calibre: {pulled_calibre}, pulled Kavita: {pulled_kavita}, "
+            f"reconciled: {reconciled}, "
+            f"pushed Calibre: {pushed_calibre}, pushed Kavita: {pushed_kavita}."
         )
         return {
-            "updated_hub": updated_hub,
-            "updated_calibre": updated_calibre,
-            "updated_kavita": updated_kavita,
+            "pulled_calibre": pulled_calibre,
+            "pulled_kavita": pulled_kavita,
+            "reconciled": reconciled,
+            "pushed_calibre": pushed_calibre,
+            "pushed_kavita": pushed_kavita,
+            # Backward compatibility aliases
+            "updated_calibre": pushed_calibre,
+            "updated_kavita": pushed_kavita,
+            "updated_hub": (pushed_calibre + pushed_kavita),
             "timestamp": self.last_sync_timestamp,
             "status": self.last_sync_status,
             "error": error_msg,
